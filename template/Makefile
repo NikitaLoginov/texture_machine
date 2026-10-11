@@ -4,6 +4,7 @@ CPP_STANDARD = -std=gnu++17
 
 CPP_SOURCES = \
     main.cpp \
+    grain_player.cpp \
     ../touch/knobs.cpp \
     ../touch/pads.cpp \
     ../touch/switches.cpp

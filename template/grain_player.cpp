@@ -23,6 +23,7 @@ void GrainPlayer::Init(const float* buf_l, const float* buf_r, size_t capacity, 
     start_[1] = 0.0f;
     gdir_[0] = 1.0f;
     gdir_[1] = 1.0f;
+    off_[0] = off_[1] = 0.0f;
 
     UpdateRegion();
 }
@@ -79,6 +80,7 @@ void GrainPlayer::Reset() {
     start_[1] = pos_;
     gdir_[0] = dir_;
     gdir_[1] = dir_;
+    off_[0] = off_[1] = 0.0f;
 }
 
 void GrainPlayer::UpdateRegion() {
@@ -137,10 +139,12 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
         phase_ -= 1.0f;
         start_[0] = pos_;
         gdir_[0] = dir_;
+        off_[0] = 0.0f;
     }
     if (prev < 0.5f && phase_ >= 0.5f) {
         start_[1] = pos_;
         gdir_[1] = dir_;
+        off_[1] = 0.0f;
     }
 
     const float ph0 = phase_;
@@ -156,7 +160,7 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
 
     // Grain 0.
     {
-        float rel = start_[0] + gdir_[0] * ph0 * grain_len_ * ratio_;
+        float rel = start_[0] + off_[0];
         rel = Wrap(rel, region_len_);
         float edge = rel * inv_fade;
         const float edge_end = (region_len_ - rel) * inv_fade;
@@ -175,7 +179,7 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
 
     // Grain 1.
     {
-        float rel = start_[1] + gdir_[1] * ph1 * grain_len_ * ratio_;
+        float rel = start_[1] + off_[1];
         rel = Wrap(rel, region_len_);
         float edge = rel * inv_fade;
         const float edge_end = (region_len_ - rel) * inv_fade;
@@ -191,6 +195,10 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
         l += w * (buf_l_[i0] + frac * (buf_l_[i1] - buf_l_[i0]));
         r += w * (buf_r_[i0] + frac * (buf_r_[i1] - buf_r_[i0]));
     }
+
+    // Advance grain read offsets (integrated, so ratio changes don't make grains jump).
+    off_[0] += gdir_[0] * ratio_;
+    off_[1] += gdir_[1] * ratio_;
 
     out_l = l;
     out_r = r;

@@ -4,6 +4,8 @@
 #include "grain_player.h"
 #include "tape_echo.h"
 #include "control_filter.h"
+#include "motor.h"
+#include "tape_format.h"
 #include <cmath>
 
 using namespace daisy;
@@ -14,7 +16,8 @@ static DaisySeed   hw;
 static Touch       touch;
 static GrainPlayer player;
 static Adsr env;
-static Svf  filt_l, filt_r;
+static TapeFormat fmt_l, fmt_r;   // tape type character per channel
+static Motor      motor;          // one tape transport for both channels
 static TapeEcho tape_l, tape_r;
 static ControlFilter ctl[8];   // S30..S35, left fader (S36), right fader (S37)
 
@@ -26,10 +29,10 @@ static float DSY_SDRAM_BSS buf_r[kMaxSamples];
 static volatile bool  want_play    = false;
 static volatile bool  want_record  = false;
 static volatile bool  want_overdub = false;
-static volatile float grain_ms = 100.0f, speed = 1.0f, pitch = 0.0f;
+static volatile float grain_ms = 100.0f, battery = 0.5f, pitch = 0.0f;
 static volatile float range_a = 0.0f, range_b = 1.0f;
 static volatile int   mode = GrainPlayer::FORWARD;
-static volatile float fade_ms = 200.0f, cutoff = 1000.0f, res = 0.0f;
+static volatile float fade_ms = 200.0f, tape_type = 0.33f, res = 0.0f;
 static volatile bool  want_wet = false;   // P07: tape + echo on/off
 
 // Written by audio callback, read by main loop
@@ -69,16 +72,21 @@ void AudioCallback(AudioHandle::InputBuffer in,
     was_overdub = od;
 
     // 3. Pass parameters
+    // Tape transport: battery -> tape speed, with wow/flutter for this tape type.
+    const float type = tape_type;
+    motor.SetBattery(battery);
+    motor.SetWobble(TapeFormat::Wobble(type));
+    const float tape_speed = motor.Process();
+    const float deficit    = motor.Deficit();
     player.SetMode((GrainPlayer::Mode)mode);
-    player.SetSpeed(speed);
-    player.SetPitch(pitch);
+    player.SetSpeed(tape_speed);
+    // Varispeed: pitch follows tape speed; S32 adds an offset.
+    player.SetPitch(pitch + 12.0f * log2f(tape_speed > 0.01f ? tape_speed : 0.01f));
     player.SetGrainMs(grain_ms);
     player.SetRange(range_a, range_b);
     player.SetFadeMs(fade_ms);
-    filt_l.SetFreq(cutoff);
-    filt_r.SetFreq(cutoff);
-    filt_l.SetRes(res);
-    filt_r.SetRes(res);
+    fmt_l.SetParams(type, deficit, tape_speed, res);
+    fmt_r.SetParams(type, deficit, tape_speed, res);
 
     for (size_t i = 0; i < size; i++) {
         float in_l = in[0][i], in_r = in[1][i];
@@ -99,9 +107,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
         float e = env.Process(play);
         float l = 0.0f, r = 0.0f;
         if ((play || env.IsRunning()) && !rec) player.Process(l, r);
-        filt_l.Process(l);
-        filt_r.Process(r);
-        const float fl = filt_l.Low(), fr = filt_r.Low();
+        const float fl = fmt_l.Process(l), fr = fmt_r.Process(r);   // tape format character
         // Tape + echo always run, so the echo already has content when switched in.
         const float wl = tape_l.Process(fl), wr = tape_r.Process(fr);
         // 50 ms linear dry/wet crossfade (P07).
@@ -132,10 +138,9 @@ int main(void) {
     env.SetReleaseTime(0.01f);
     env.SetDecayTime(0.01f);
     env.SetSustainLevel(1.0f);
-    filt_l.Init(sr);
-    filt_r.Init(sr);
-    filt_l.SetDrive(0.0f);
-    filt_r.SetDrive(0.0f);
+    fmt_l.Init(sr, 1);
+    fmt_r.Init(sr, 0x2545F491);   // different seed: independent hiss per channel
+    motor.Init(hw.AudioCallbackRate());
     tape_l.Init(sr);
     tape_r.Init(sr);
     wet_step = 1.0f / (0.05f * sr);   // 50 ms crossfade
@@ -175,12 +180,12 @@ int main(void) {
         const float c36 = ctl[6].Process(k.LeftFader());
         const float c37 = ctl[7].Process(k.RightFader());
         grain_ms = 10.0f * powf(50.0f, c30);          // S30: 10..500 ms, exponential
-        speed    = 2.0f * c31;                        // S31: 0..2 (0 = freeze)
+        battery  = c31;                               // S31: battery 0 dead, 0.5 fresh, 1 over-voltage
         float st = (c32 - 0.5f) * 24.0f;              // S32: -12..+12 semitones
         if (fabsf(st) < 0.25f) st = 0.0f;             // snap to 0 near center
         pitch    = st;
         fade_ms  = 10.0f + 1990.0f * c33;             // S33: loop-edge fade, 10 ms..2 s
-        cutoff   = 20.0f * powf(500.0f, c34);         // S34: 20 Hz..10 kHz, exponential
+        tape_type = c34;                              // S34: tape type 0 reel-to-reel .. 1 dictaphone
         float q  = 0.5f + 10.0f * c35;                // S35: filter Q 0.5..10.5
         float rr = 1.0f - 0.5f / q;                   // Svf resonance giving that Q
         res      = rr * rr * rr * rr;

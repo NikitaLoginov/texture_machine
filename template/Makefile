@@ -6,6 +6,8 @@ CPP_SOURCES = \
     main.cpp \
     grain_player.cpp \
     tape_echo.cpp \
+    motor.cpp \
+    tape_format.cpp \
     ../touch/knobs.cpp \
     ../touch/pads.cpp \
     ../touch/switches.cpp

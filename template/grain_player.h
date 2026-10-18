@@ -44,4 +44,5 @@ private:
     float phase_;
     float start_[2];
     float gdir_[2];
+    float off_[2];      // per-grain read offset from start_, advanced by gdir_ * ratio_
 };

@@ -8,6 +8,7 @@ CPP_SOURCES = \
     tape_echo.cpp \
     motor.cpp \
     tape_format.cpp \
+    record_head.cpp \
     ../touch/knobs.cpp \
     ../touch/pads.cpp \
     ../touch/switches.cpp

@@ -16,14 +16,15 @@ void GrainPlayer::Init(const float* buf_l, const float* buf_r, size_t capacity, 
     ratio_ = 1.0f;
     SetGrainMs(100.0f);
     SetFadeMs(10.0f);
-    pos_ = 0.0f;
+    pos_ = 0.0;
     dir_ = 1.0f;
+    step_ = 0.0f;
     phase_ = 0.0f;
-    start_[0] = 0.0f;
-    start_[1] = 0.0f;
+    start_[0] = 0.0;
+    start_[1] = 0.0;
     gdir_[0] = 1.0f;
     gdir_[1] = 1.0f;
-    off_[0] = off_[1] = 0.0f;
+    off_[0] = off_[1] = 0.0;
 
     UpdateRegion();
 }
@@ -73,48 +74,49 @@ void GrainPlayer::SetFadeMs(float ms) {
 }
 
 void GrainPlayer::Reset() {
-    pos_ = (mode_ == BACKWARD) ? (region_len_ - 1.0f) : 0.0f;
-    if (pos_ < 0.0f) pos_ = 0.0f;
+    pos_ = (mode_ == BACKWARD) ? (region_len_ - 1.0) : 0.0;
+    if (pos_ < 0.0) pos_ = 0.0;
     phase_ = 0.0f;
     start_[0] = pos_;
     start_[1] = pos_;
     gdir_[0] = dir_;
     gdir_[1] = dir_;
-    off_[0] = off_[1] = 0.0f;
+    off_[0] = off_[1] = 0.0;
 }
 
 void GrainPlayer::UpdateRegion() {
     const float lo = (range_a_ < range_b_) ? range_a_ : range_b_;
     const float hi = (range_a_ < range_b_) ? range_b_ : range_a_;
-    const float len = (float)length_;
-    region_start_ = lo * len;
-    region_len_ = (hi - lo) * len;
+    const double len = (double)length_;
+    region_start_ = floor(lo * len);          // whole samples
+    region_len_ = floor((hi - lo) * len);
 
-    const float kMinRegion = 480.0f;   // 10 ms at 48 kHz
+    const double kMinRegion = 480.0;   // 10 ms at 48 kHz
     if (region_len_ < kMinRegion) {
         region_len_ = kMinRegion;
         if (region_start_ + region_len_ > len) region_start_ = len - region_len_;
-        if (region_start_ < 0.0f) {
-            region_start_ = 0.0f;
+        if (region_start_ < 0.0) {
+            region_start_ = 0.0;
             region_len_ = len;
         }
     }
 
-    if (region_len_ >= 1.0f) pos_ = Wrap(pos_, region_len_);
-    else pos_ = 0.0f;
+    if (region_len_ >= 1.0) pos_ = Wrap(pos_, region_len_);
+    else pos_ = 0.0;
 }
 
-float GrainPlayer::Wrap(float x, float len) {
-    x = fmodf(x, len);
-    if (x < 0.0f) x += len;
-    if (x >= len) x = 0.0f;
+double GrainPlayer::Wrap(double x, double len) {
+    x = fmod(x, len);
+    if (x < 0.0) x += len;
+    if (x >= len) x = 0.0;
     return x;
 }
 
 void GrainPlayer::Process(float& out_l, float& out_r) {
     static constexpr float kTwoPi = 6.28318530718f;
 
-    if (length_ < 2 || region_len_ < 2.0f) {
+    if (length_ < 2 || region_len_ < 2.0) {
+        step_ = 0.0f;
         out_l = 0.0f;
         out_r = 0.0f;
         return;
@@ -123,11 +125,12 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
     // Advance playhead.
     if (mode_ == FORWARD) dir_ = 1.0f;
     else if (mode_ == BACKWARD) dir_ = -1.0f;
-    pos_ += dir_ * speed_;
+    step_ = dir_ * speed_;
+    pos_ += step_;
     if (mode_ == PINGPONG) {
-        if (pos_ >= region_len_) { pos_ = 2.0f * region_len_ - pos_; dir_ = -1.0f; }
-        if (pos_ < 0.0f) { pos_ = -pos_; dir_ = 1.0f; }
-        if (pos_ < 0.0f || pos_ >= region_len_) pos_ = Wrap(pos_, region_len_);
+        if (pos_ >= region_len_) { pos_ = 2.0 * region_len_ - pos_; dir_ = -1.0f; }
+        if (pos_ < 0.0) { pos_ = -pos_; dir_ = 1.0f; }
+        if (pos_ < 0.0 || pos_ >= region_len_) pos_ = Wrap(pos_, region_len_);
     } else {
         pos_ = Wrap(pos_, region_len_);
     }
@@ -139,12 +142,12 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
         phase_ -= 1.0f;
         start_[0] = pos_;
         gdir_[0] = dir_;
-        off_[0] = 0.0f;
+        off_[0] = 0.0;
     }
     if (prev < 0.5f && phase_ >= 0.5f) {
         start_[1] = pos_;
         gdir_[1] = dir_;
-        off_[1] = 0.0f;
+        off_[1] = 0.0;
     }
 
     const float ph0 = phase_;
@@ -154,22 +157,22 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
     float r = 0.0f;
 
     // Loop-edge fade: at most half the region, so fade-in and fade-out never overlap.
-    float fade = fade_len_;
-    if (fade > 0.5f * region_len_) fade = 0.5f * region_len_;
-    const float inv_fade = 1.0f / fade;
+    double fade = fade_len_;
+    if (fade > 0.5 * region_len_) fade = 0.5 * region_len_;
+    const double inv_fade = 1.0 / fade;
 
     // Grain 0.
     {
-        float rel = start_[0] + off_[0];
+        double rel = start_[0] + off_[0];
         rel = Wrap(rel, region_len_);
-        float edge = rel * inv_fade;
-        const float edge_end = (region_len_ - rel) * inv_fade;
+        float edge = (float)(rel * inv_fade);
+        const float edge_end = (float)((region_len_ - rel) * inv_fade);
         if (edge_end < edge) edge = edge_end;
         if (edge > 1.0f) edge = 1.0f;
-        float idx = region_start_ + rel;
+        const double idx = region_start_ + rel;
         size_t i0 = (size_t)idx;
         if (i0 >= length_) i0 = length_ - 1;
-        const float frac = idx - (float)i0;
+        const float frac = (float)(idx - (double)i0);
         size_t i1 = i0 + 1;
         if (i1 >= length_) i1 = 0;
         const float w = (0.5f - 0.5f * cosf(kTwoPi * ph0)) * edge;
@@ -179,16 +182,16 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
 
     // Grain 1.
     {
-        float rel = start_[1] + off_[1];
+        double rel = start_[1] + off_[1];
         rel = Wrap(rel, region_len_);
-        float edge = rel * inv_fade;
-        const float edge_end = (region_len_ - rel) * inv_fade;
+        float edge = (float)(rel * inv_fade);
+        const float edge_end = (float)((region_len_ - rel) * inv_fade);
         if (edge_end < edge) edge = edge_end;
         if (edge > 1.0f) edge = 1.0f;
-        float idx = region_start_ + rel;
+        const double idx = region_start_ + rel;
         size_t i0 = (size_t)idx;
         if (i0 >= length_) i0 = length_ - 1;
-        const float frac = idx - (float)i0;
+        const float frac = (float)(idx - (double)i0);
         size_t i1 = i0 + 1;
         if (i1 >= length_) i1 = 0;
         const float w = (0.5f - 0.5f * cosf(kTwoPi * ph1)) * edge;

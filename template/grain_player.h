@@ -16,9 +16,16 @@ public:
     void Reset();                      // playhead and grains back to region start
     void Process(float& out_l, float& out_r);  // one stereo frame
 
+    // For the overdub record head:
+    double Pos() const { return pos_; }                      // playhead inside the region, samples
+    float  Step() const { return step_; }                    // signed move in the last Process(), before wrap/bounce
+    bool   Bounces() const { return mode_ == PINGPONG; }
+    size_t RegionStart() const { return (size_t)region_start_; }
+    size_t RegionLen() const { return (size_t)region_len_; }
+
 private:
     void UpdateRegion();
-    static float Wrap(float x, float len);
+    static double Wrap(double x, double len);
 
     const float* buf_l_;
     const float* buf_r_;
@@ -28,8 +35,8 @@ private:
     size_t length_;
     float range_a_;
     float range_b_;
-    float region_start_;
-    float region_len_;
+    double region_start_;
+    double region_len_;
 
     Mode mode_;
     float speed_;
@@ -38,11 +45,12 @@ private:
     float phase_inc_;
     float fade_len_;   // samples
 
-    float pos_;
+    double pos_;
     float dir_;
+    float step_;
 
     float phase_;
-    float start_[2];
+    double start_[2];
     float gdir_[2];
-    float off_[2];      // per-grain read offset from start_, advanced by gdir_ * ratio_
+    double off_[2];     // per-grain read offset from start_, advanced by gdir_ * ratio_
 };

@@ -5,6 +5,7 @@
 #include "control_filter.h"
 #include "motor.h"
 #include "tape_format.h"
+#include "record_head.h"
 #include <cmath>
 
 using namespace daisy;
@@ -17,6 +18,7 @@ static GrainPlayer player;
 static Adsr env;
 static TapeFormat fmt_l, fmt_r;   // tape type character per channel
 static Motor      motor;          // one tape transport for both channels
+static RecordHead head;           // overdub record head, follows the playhead
 static ControlFilter ctl[8];   // S30..S35, left fader (S36), right fader (S37)
 
 static constexpr size_t kMaxSamples = 48000 * 30;   // 30 s per channel
@@ -27,7 +29,7 @@ static float DSY_SDRAM_BSS buf_r[kMaxSamples];
 static volatile bool  want_play    = false;
 static volatile bool  want_record  = false;
 static volatile bool  want_overdub = false;
-static volatile float grain_ms = 100.0f, battery = 0.5f, pitch = 0.0f;
+static volatile float grain_ms = 100.0f, battery = 0.5f, decay = 1.0f;
 static volatile float range_a = 0.0f, range_b = 1.0f;
 static volatile int   mode = GrainPlayer::FORWARD;
 static volatile float fade_ms = 200.0f, tape_type = 0.33f, res = 0.0f;
@@ -37,7 +39,7 @@ static volatile size_t length = 0;   // recorded samples per channel
 
 // Callback-only state
 static bool    was_play = false, was_record = false, was_overdub = false;
-static size_t  rec_pos = 0, od_pos = 0;
+static size_t  rec_pos = 0;
 
 void AudioCallback(AudioHandle::InputBuffer in,
                    AudioHandle::OutputBuffer out,
@@ -57,7 +59,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
         player.Reset();
     }
     if (od && !was_overdub) {
-        od_pos = 0;
+        head.Start();
     }
     if (play && !was_play && !env.IsRunning()) {
         player.Reset();
@@ -69,14 +71,15 @@ void AudioCallback(AudioHandle::InputBuffer in,
     // 3. Pass parameters
     // Tape transport: battery -> tape speed, with wow/flutter for this tape type.
     const float type = tape_type;
+    const float dec  = decay;     // overdub: share of the old loop kept per pass
     motor.SetBattery(battery);
     motor.SetWobble(TapeFormat::Wobble(type));
     const float tape_speed = motor.Process();
     const float deficit    = motor.Deficit();
     player.SetMode((GrainPlayer::Mode)mode);
     player.SetSpeed(tape_speed);
-    // Varispeed: pitch follows tape speed; S32 adds an offset.
-    player.SetPitch(pitch + 12.0f * log2f(tape_speed > 0.01f ? tape_speed : 0.01f));
+    // Varispeed: pitch follows tape speed.
+    player.SetPitch(12.0f * log2f(tape_speed > 0.01f ? tape_speed : 0.01f));
     player.SetGrainMs(grain_ms);
     player.SetRange(range_a, range_b);
     player.SetFadeMs(fade_ms);
@@ -93,15 +96,17 @@ void AudioCallback(AudioHandle::InputBuffer in,
             } else {
                 want_record = false;   // buffer full: auto-stop, finalized next block
             }
-        } else if (od && length > 0) {
-            if (od_pos >= length) od_pos = 0;
-            buf_l[od_pos] += in_l;
-            buf_r[od_pos] += in_r;
-            od_pos++;
         }
         float e = env.Process(play);
         float l = 0.0f, r = 0.0f;
-        if ((play || env.IsRunning()) && !rec) player.Process(l, r);
+        if ((play || env.IsRunning()) && !rec) {
+            player.Process(l, r);
+            // Overdub: the record head follows the playhead, only while the tape moves.
+            if (od) {
+                head.Process(player.Pos(), player.Step(), player.Bounces(),
+                             player.RegionStart(), player.RegionLen(), in_l, in_r, dec);
+            }
+        }
         const float fl = fmt_l.Process(l), fr = fmt_r.Process(r);   // tape format character
         out[0][i] = fl * e + in_l;   // grains (tape format, enveloped) + dry input monitor
         out[1][i] = fr * e + in_r;
@@ -120,6 +125,7 @@ int main(void) {
     }
 
     player.Init(buf_l, buf_r, kMaxSamples, hw.AudioSampleRate());
+    head.Init(buf_l, buf_r);
     float sr = hw.AudioSampleRate();
     env.Init(sr);
     env.SetAttackTime(0.01f);    // play/stop declick: 10 ms in, 10 ms out
@@ -164,9 +170,9 @@ int main(void) {
         const float c37 = ctl[7].Process(k.RightFader());
         grain_ms = 10.0f * powf(50.0f, c30);          // S30: 10..500 ms, exponential
         battery  = c31;                               // S31: battery 0 dead, 0.5 fresh, 1 over-voltage
-        float st = (c32 - 0.5f) * 24.0f;              // S32: -12..+12 semitones
-        if (fabsf(st) < 0.25f) st = 0.0f;             // snap to 0 near center
-        pitch    = st;
+        // S32: overdub decay. Below 0.02 = 100 % kept (never fades), 0.5 = 87 % kept per pass, 1 = replace.
+        const float keep = 1.0f - c32;
+        decay    = (keep > 0.98f) ? 1.0f : 1.0f - powf(0.02f, keep) + 0.02f * keep;
         fade_ms  = 10.0f + 1990.0f * c33;             // S33: loop-edge fade, 10 ms..2 s
         tape_type = c34;                              // S34: tape type 0 reel-to-reel .. 1 dictaphone
         float q  = 0.5f + 10.0f * c35;                // S35: filter Q 0.5..10.5

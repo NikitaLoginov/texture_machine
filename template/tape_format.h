@@ -1,7 +1,7 @@
 #pragma once
 #include "daisysp.h"
 
-// Playback character of a tape format, one channel: saturation -> hiss -> high-pass -> low-pass.
+// Playback character of a tape format, one channel: saturation -> high-pass -> low-pass, + hiss.
 class TapeFormat {
 public:
     void  Init(float sample_rate, int32_t noise_seed);
@@ -12,7 +12,7 @@ public:
     float Process(float in);
     static float Wobble(float type);   // tape wow/flutter depth for Motor::SetWobble
 private:
-    daisysp::Svf        hp_, lp_;
+    daisysp::Svf        hp_, lp_, hiss_lp_;
     daisysp::WhiteNoise noise_;
-    float drive_ = 1.0f, hiss_ = 0.0f;
+    float drive_ = 1.0f, norm_ = 1.0f;     // saturation drive and make-up gain
 };

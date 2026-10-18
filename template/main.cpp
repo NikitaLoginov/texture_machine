@@ -2,7 +2,6 @@
 #include "daisysp.h"
 #include "touch/touch.h"
 #include "grain_player.h"
-#include "tape_echo.h"
 #include "control_filter.h"
 #include "motor.h"
 #include "tape_format.h"
@@ -18,7 +17,6 @@ static GrainPlayer player;
 static Adsr env;
 static TapeFormat fmt_l, fmt_r;   // tape type character per channel
 static Motor      motor;          // one tape transport for both channels
-static TapeEcho tape_l, tape_r;
 static ControlFilter ctl[8];   // S30..S35, left fader (S36), right fader (S37)
 
 static constexpr size_t kMaxSamples = 48000 * 30;   // 30 s per channel
@@ -33,7 +31,6 @@ static volatile float grain_ms = 100.0f, battery = 0.5f, pitch = 0.0f;
 static volatile float range_a = 0.0f, range_b = 1.0f;
 static volatile int   mode = GrainPlayer::FORWARD;
 static volatile float fade_ms = 200.0f, tape_type = 0.33f, res = 0.0f;
-static volatile bool  want_wet = false;   // P07: tape + echo on/off
 
 // Written by audio callback, read by main loop
 static volatile size_t length = 0;   // recorded samples per channel
@@ -41,7 +38,6 @@ static volatile size_t length = 0;   // recorded samples per channel
 // Callback-only state
 static bool    was_play = false, was_record = false, was_overdub = false;
 static size_t  rec_pos = 0, od_pos = 0;
-static float   wet_gain = 0.0f, wet_step = 0.0f;   // dry/wet crossfade, step set in main()
 
 void AudioCallback(AudioHandle::InputBuffer in,
                    AudioHandle::OutputBuffer out,
@@ -50,7 +46,6 @@ void AudioCallback(AudioHandle::InputBuffer in,
     bool play = want_play;
     bool rec  = want_record;
     bool od   = want_overdub;
-    const float wet_target = want_wet ? 1.0f : 0.0f;
 
     // 2. Edge handling
     if (rec && !was_record) {
@@ -108,15 +103,8 @@ void AudioCallback(AudioHandle::InputBuffer in,
         float l = 0.0f, r = 0.0f;
         if ((play || env.IsRunning()) && !rec) player.Process(l, r);
         const float fl = fmt_l.Process(l), fr = fmt_r.Process(r);   // tape format character
-        // Tape + echo always run, so the echo already has content when switched in.
-        const float wl = tape_l.Process(fl), wr = tape_r.Process(fr);
-        // 50 ms linear dry/wet crossfade (P07).
-        if (wet_gain < wet_target) { wet_gain += wet_step; if (wet_gain > wet_target) wet_gain = wet_target; }
-        else if (wet_gain > wet_target) { wet_gain -= wet_step; if (wet_gain < wet_target) wet_gain = wet_target; }
-        const float ml = fl + (wl - fl) * wet_gain;
-        const float mr = fr + (wr - fr) * wet_gain;
-        out[0][i] = ml * e + in_l;   // grains (filtered, dry/wet, enveloped) + dry input monitor
-        out[1][i] = mr * e + in_r;
+        out[0][i] = fl * e + in_l;   // grains (tape format, enveloped) + dry input monitor
+        out[1][i] = fr * e + in_r;
     }
 }
 
@@ -141,9 +129,6 @@ int main(void) {
     fmt_l.Init(sr, 1);
     fmt_r.Init(sr, 0x2545F491);   // different seed: independent hiss per channel
     motor.Init(hw.AudioCallbackRate());
-    tape_l.Init(sr);
-    tape_r.Init(sr);
-    wet_step = 1.0f / (0.05f * sr);   // 50 ms crossfade
     touch.Init(hw);
     hw.StartAudio(AudioCallback);
 
@@ -163,8 +148,6 @@ int main(void) {
         } else if (pad == 11) {                 // P11: overdub start / stop (latched)
             if (want_overdub) { want_overdub = false; }
             else if (!want_record && length > 0) { want_overdub = true; }
-        } else if (pad == 7) {                  // P07: tape + echo on/off (latched)
-            want_wet = !want_wet;
         }
     });
 

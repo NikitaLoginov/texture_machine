@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cmath>
 
 // Removes ADC jitter from a 0..1 control: the output holds still until the input moves more
 // than kBand away, then follows it. Rescaled so 0 and 1 stay reachable.
@@ -42,4 +43,33 @@ private:
     float    out_ = 0.0f;       // applied value
     uint32_t moved_ms_ = 0;     // time of the last input change
     bool     init_ = false;
+};
+
+// Soft takeover for a knob shared between two jobs: the value only follows the knob once the
+// knob has reached it (within 0.01) or passed it since the job became active again.
+class Pickup {
+public:
+    // value: start value. caught: follow the knob from the start (else catch it first).
+    Pickup(float value, bool caught) : value_(value), caught_(caught) {}
+
+    void  Release() { caught_ = false; armed_ = false; }   // the knob goes to the other job
+    float Value() const { return value_; }
+
+    float Process(float knob) {
+        if (!caught_) {
+            const bool crossed = armed_ && ((last_ <= value_ && knob >= value_) ||
+                                           (last_ >= value_ && knob <= value_));
+            if (crossed || fabsf(knob - value_) < 0.01f) caught_ = true;
+            last_ = knob;
+            armed_ = true;
+        }
+        if (caught_) value_ = knob;
+        return value_;
+    }
+
+private:
+    float value_;
+    float last_ = 0.0f;
+    bool  caught_;
+    bool  armed_ = false;
 };

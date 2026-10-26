@@ -9,6 +9,11 @@ void GrainPlayer::Init(const float* buf_l, const float* buf_r, size_t capacity, 
     pre_r_ = nullptr;
     pre_len_ = 0;
     pre_phase_ = 0;
+    ovd_l_ = nullptr;
+    ovd_r_ = nullptr;
+    ovd_pre_l_ = nullptr;
+    ovd_pre_r_ = nullptr;
+    ovd_pre_len_ = 0;
     capacity_ = capacity;
     sr_ = sample_rate;
 
@@ -29,10 +34,9 @@ void GrainPlayer::Init(const float* buf_l, const float* buf_r, size_t capacity, 
     gdir_[0] = 1.0f;
     gdir_[1] = 1.0f;
     off_[0] = off_[1] = 0.0;
+    next_start_ = next_len_ = 0.0;
 
     UpdateRegion();
-    gbase_[0] = gbase_[1] = region_start_;
-    glen_[0] = glen_[1] = region_len_;
 }
 
 void GrainPlayer::SetLength(size_t length) {
@@ -49,6 +53,10 @@ void GrainPlayer::SetRange(float a, float b) {
 }
 
 void GrainPlayer::SetMode(Mode mode) {
+    if (mode != mode_) {   // a loop change waiting for the wrap starts over in the new mode
+        latched_ = false;
+        lead_start_ = region_start_;
+    }
     mode_ = mode;
     if (mode == FORWARD) dir_ = 1.0f;
     else if (mode == BACKWARD) dir_ = -1.0f;
@@ -60,8 +68,8 @@ void GrainPlayer::SetSpeed(float speed) {
 }
 
 void GrainPlayer::SetPitch(float semitones) {
-    if (semitones < -24.0f) semitones = -24.0f;
-    else if (semitones > 24.0f) semitones = 24.0f;
+    if (semitones < -36.0f) semitones = -36.0f;
+    else if (semitones > 36.0f) semitones = 36.0f;
     ratio_ = powf(2.0f, semitones / 12.0f);
 }
 
@@ -85,6 +93,14 @@ void GrainPlayer::SetPreRoll(const float* l, const float* r, size_t len, size_t 
     pre_phase_ = (len > 0) ? phase % len : 0;
 }
 
+void GrainPlayer::SetOverdub(const float* l, const float* r, const float* pre_l, const float* pre_r, size_t pre_len) {
+    ovd_l_ = l;
+    ovd_r_ = r;
+    ovd_pre_l_ = pre_l;
+    ovd_pre_r_ = pre_r;
+    ovd_pre_len_ = pre_len;
+}
+
 void GrainPlayer::Reset() {
     UpdateRegion();   // a pending loop change applies on play start
     pos_ = (mode_ == BACKWARD) ? (region_len_ - 1.0) : 0.0;
@@ -95,25 +111,27 @@ void GrainPlayer::Reset() {
     gdir_[0] = dir_;
     gdir_[1] = dir_;
     off_[0] = off_[1] = 0.0;
-    gbase_[0] = gbase_[1] = region_start_;
-    glen_[0] = glen_[1] = region_len_;
 }
 
+// Applies the loop set by SetRange now (new recording, play start).
 void GrainPlayer::UpdateRegion() {
-    // Left fader (range_a_) sets the start, right fader (range_b_) the loop length as a share of
-    // the recording after the start, so the end always follows the start.
+    NextRegion(region_start_, region_len_);
+    lead_start_ = region_start_;
+    latched_ = false;
+    if (region_len_ >= 1.0) pos_ = Wrap(pos_, region_len_);
+    else pos_ = 0.0;
+}
+
+// The loop set by SetRange. Left fader (range_a_) sets the start, right fader (range_b_) the loop
+// length as a share of the recording after the start, so the end always follows the start.
+void GrainPlayer::NextRegion(double& start, double& rlen) const {
     const double kMinRegion = 480.0;   // 10 ms at 48 kHz
     const double len = (double)length_;
-    double start = floor(range_a_ * len);   // whole samples
-    double rlen = floor(range_b_ * (len - start));
+    start = floor(range_a_ * len);   // whole samples
+    rlen = floor(range_b_ * (len - start));
     if (rlen < kMinRegion) rlen = kMinRegion;
     if (start + rlen > len) start = len - rlen;
     if (start < 0.0) { start = 0.0; rlen = len; }
-    region_start_ = start;
-    region_len_ = rlen;
-
-    if (region_len_ >= 1.0) pos_ = Wrap(pos_, region_len_);
-    else pos_ = 0.0;
 }
 
 double GrainPlayer::Wrap(double x, double len) {
@@ -123,39 +141,93 @@ double GrainPlayer::Wrap(double x, double len) {
     return x;
 }
 
-// Crossfade length (whole samples) for a loop of n samples starting at base: the S33 time,
-// at most half the loop and at most the material before the start (recording + lead-in).
-long GrainPlayer::Xfade(long base, long n) const {
+// Crossfade length (whole samples) for a loop of n samples: the S33 time, at most half the loop.
+// (The lead-in is as long as the longest crossfade, so there is always material before a start.)
+long GrainPlayer::Xfade(long n) const {
     double x = fade_len_;
     if (x > 0.5 * (double)n) x = 0.5 * (double)n;
-    const double avail = (double)base + (double)pre_len_;
-    if (x > avail) x = avail;
     return (long)x;
 }
 
-// Loop sample k (0 .. n-1) of the loop starting at base. Over the last xf samples the loop end
-// fades out while the audio leading into the start fades in (the recording before base, or the
-// lead-in before the recording), so the wrap from n-1 back to 0 is seamless in both directions.
-void GrainPlayer::LoopSample(long base, long n, long xf, long k, float& out_l, float& out_r) const {
-    long i = base + k;
-    if (i >= (long)length_) i = (long)length_ - 1;
-    if (i < 0) i = 0;
-    out_l = buf_l_[i];
-    out_r = buf_r_[i];
-    if (xf < 1 || k < n - xf) return;
-    const float t = (float)(k - (n - xf)) / (float)xf;   // 0 .. 1 across the crossfade
-    const long m = base - (n - k);                        // lead sample, before the start
-    float lead_l = 0.0f, lead_r = 0.0f;
+// Overdub track seam (whole samples): kOvdXfade, at most half the loop.
+long GrainPlayer::OvdXfade(long n) const {
+    return (kOvdXfade < n / 2) ? kOvdXfade : n / 2;
+}
+
+// Sample m of the recording, or of the lead-in when m < 0 (silence when out of range).
+void GrainPlayer::Lead(long m, float& out_l, float& out_r) const {
+    out_l = 0.0f;
+    out_r = 0.0f;
     if (m >= 0) {
-        lead_l = buf_l_[m];
-        lead_r = buf_r_[m];
+        if (m < (long)length_) {
+            out_l = buf_l_[m];
+            out_r = buf_r_[m];
+        }
     } else if (pre_len_ > 0 && -m <= (long)pre_len_) {
         const size_t j = (size_t)((long)pre_phase_ + (long)pre_len_ + m) % pre_len_;
-        lead_l = pre_l_[j];
-        lead_r = pre_r_[j];
+        out_l = pre_l_[j];
+        out_r = pre_r_[j];
     }
-    out_l += t * (lead_l - out_l);
-    out_r += t * (lead_r - out_r);
+}
+
+// Overdub track sample m, or its lead-in when m < 0 (silence when out of range).
+void GrainPlayer::OvdLead(long m, float& out_l, float& out_r) const {
+    out_l = 0.0f;
+    out_r = 0.0f;
+    if (m >= 0) {
+        if (m < (long)length_) {
+            out_l = ovd_l_[m];
+            out_r = ovd_r_[m];
+        }
+    } else if (-m <= (long)ovd_pre_len_) {
+        out_l = ovd_pre_l_[(long)ovd_pre_len_ + m];
+        out_r = ovd_pre_r_[(long)ovd_pre_len_ + m];
+    }
+}
+
+// Loop sample k (0 .. n) of the current loop of n samples: recording + overdub track.
+// Recording: over the last xf samples (S33) an equal-power crossfade from the loop end into the
+// audio before lead_start_. Overdub track: the same over its own short seam xo, into the overdub
+// track before lead_start_. k = n is the sample that follows the end: the leads at distance 0.
+// Normally lead_start_ is the loop start; during a loop change it is the other loop's start.
+void GrainPlayer::LoopSample(long n, long xf, long xo, long k, float& out_l, float& out_r) const {
+    long i = (long)region_start_ + ((k >= n) ? 0 : k);
+    if (i >= (long)length_) i = (long)length_ - 1;
+    if (i < 0) i = 0;
+    // Recording.
+    if (k >= n && xf >= 1) {
+        Lead((long)lead_start_, out_l, out_r);
+    } else {
+        out_l = buf_l_[i];
+        out_r = buf_r_[i];
+        if (xf >= 1 && k >= n - xf) {
+            const float u = 1.5707963f * (float)(k - (n - xf)) / (float)xf;
+            const float c = cosf(u), s = sinf(u);
+            float ll, lr;
+            Lead((long)lead_start_ - (n - k), ll, lr);
+            out_l = c * out_l + s * ll;
+            out_r = c * out_r + s * lr;
+        }
+    }
+    // Overdub track.
+    if (ovd_l_ == nullptr) return;
+    float ol, orr;
+    if (k >= n && xo >= 1) {
+        OvdLead((long)lead_start_, ol, orr);
+    } else {
+        ol = ovd_l_[i];
+        orr = ovd_r_[i];
+        if (xo >= 1 && k >= n - xo) {
+            const float u = 1.5707963f * (float)(k - (n - xo)) / (float)xo;
+            const float c = cosf(u), s = sinf(u);
+            float ll, lr;
+            OvdLead((long)lead_start_ - (n - k), ll, lr);
+            ol = c * ol + s * ll;
+            orr = c * orr + s * lr;
+        }
+    }
+    out_l += ol;
+    out_r += orr;
 }
 
 void GrainPlayer::Process(float& out_l, float& out_r) {
@@ -173,26 +245,82 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
     else if (mode_ == BACKWARD) dir_ = -1.0f;
     step_ = dir_ * speed_;
     pos_ += step_;
-    // A pass ends at a wrap or bounce: a pending loop change (SetRange) applies there, so the
-    // playhead continues from the new start or end instead of jumping in the middle of a pass.
-    if (mode_ == PINGPONG) {
+
+    // A loop change (SetRange) goes through the loop crossfade, like a normal wrap, and all grains
+    // move with the playhead into the new loop:
+    // Forward: fixed kLeadMargin before the playhead enters the crossfade, whose lead then comes from before the
+    //   NEW start; applied at the wrap.
+    // Backward, Ping-Pong (end bounce only): applied at the wrap / bounce; the new loop's first
+    //   crossfade keeps the lead from before the OLD start, until the playhead leaves it.
+    double ns, nl;
+    if (mode_ == FORWARD) {
+        if (!latched_ && pos_ >= region_len_ - (double)Xfade((long)region_len_) - kLeadMargin) {
+            NextRegion(ns, nl);
+            if (ns != region_start_ || nl != region_len_) {
+                latched_ = true;
+                next_start_ = ns;
+                next_len_ = nl;
+                lead_start_ = ns;
+            }
+        }
         if (pos_ >= region_len_) {
             const double over = pos_ - region_len_;
-            UpdateRegion();
+            if (latched_) {
+                for (int g = 0; g < 2; g++) {
+                    start_[g] += off_[g] - region_len_;
+                    off_[g] = 0.0;
+                }
+                region_start_ = next_start_;
+                region_len_ = next_len_;
+                lead_start_ = region_start_;
+                latched_ = false;
+            }
+            pos_ = Wrap(over, region_len_);
+        }
+    } else if (mode_ == BACKWARD) {
+        if (pos_ < 0.0) {
+            NextRegion(ns, nl);
+            if (ns != region_start_ || nl != region_len_) {
+                for (int g = 0; g < 2; g++) {
+                    start_[g] += off_[g] + nl;
+                    off_[g] = 0.0;
+                }
+                lead_start_ = region_start_;
+                region_start_ = ns;
+                region_len_ = nl;
+            }
+            pos_ = Wrap(pos_, region_len_);
+        }
+        if (lead_start_ != region_start_ && pos_ < region_len_ - (double)Xfade((long)region_len_) - kLeadMargin)
+            lead_start_ = region_start_;
+    } else {
+        if (pos_ >= region_len_) {
+            const double over = pos_ - region_len_;
+            NextRegion(ns, nl);
+            if (ns != region_start_ || nl != region_len_) {
+                // Grains turn with the playhead (mirrored at the old end) and keep their distance
+                // to the end.
+                for (int g = 0; g < 2; g++) {
+                    double u = start_[g] + off_[g];
+                    if (gdir_[g] > 0.0f) u = 2.0 * region_len_ - u;
+                    start_[g] = u + (nl - region_len_);
+                    off_[g] = 0.0;
+                    gdir_[g] = -1.0f;
+                }
+                lead_start_ = region_start_;
+                region_start_ = ns;
+                region_len_ = nl;
+            }
             pos_ = region_len_ - over;
             dir_ = -1.0f;
         }
-        if (pos_ < 0.0) {
-            const double over = -pos_;
-            UpdateRegion();
-            pos_ = over;
-            dir_ = 1.0f;
-        }
-        if (pos_ < 0.0 || pos_ >= region_len_) pos_ = Wrap(pos_, region_len_);
-    } else if (pos_ >= region_len_ || pos_ < 0.0) {
-        const double over = (pos_ >= region_len_) ? pos_ - region_len_ : pos_;   // backward: < 0
-        UpdateRegion();
-        pos_ = Wrap(over, region_len_);
+        if (pos_ < 0.0) { pos_ = -pos_; dir_ = 1.0f; }
+        // Bounce stays inside the loop (a position exactly on the end must not wrap to 0).
+        if (pos_ >= region_len_) pos_ = region_len_ - 0.000001;
+        if (pos_ < 0.0) pos_ = 0.0;
+        if (lead_start_ != region_start_ && dir_ < 0.0f &&
+            pos_ < region_len_ - (double)Xfade((long)region_len_) - kLeadMargin)
+            lead_start_ = region_start_;
     }
 
     // Advance grain phase; restart grain 0 at 1.0 and grain 1 at 0.5 (50% overlap).
@@ -203,15 +331,11 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
         start_[0] = pos_;
         gdir_[0] = dir_;
         off_[0] = 0.0;
-        gbase_[0] = region_start_;
-        glen_[0] = region_len_;
     }
     if (prev < 0.5f && phase_ >= 0.5f) {
         start_[1] = pos_;
         gdir_[1] = dir_;
         off_[1] = 0.0;
-        gbase_[1] = region_start_;
-        glen_[1] = region_len_;
     }
 
     const float ph[2] = {phase_, (phase_ >= 0.5f) ? (phase_ - 0.5f) : (phase_ + 0.5f)};
@@ -219,23 +343,17 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
     float l = 0.0f;
     float r = 0.0f;
 
-    // Each grain reads the region it started in, so a region change never makes a sounding
-    // grain jump: old grains fade out in the old region, new ones fade in in the new region.
+    const long n = (long)region_len_;
+    const long xf = Xfade(n);
+    const long xo = OvdXfade(n);
     for (int g = 0; g < 2; g++) {
-        const double len = glen_[g];
-        if (len < 2.0) continue;   // grain started before there was a valid region
-        const long base = (long)gbase_[g];
-        const long n = (long)len;
-        const long xf = Xfade(base, n);
-        const double rel = Wrap(start_[g] + off_[g], len);
+        const double rel = Wrap(start_[g] + off_[g], region_len_);
         long k0 = (long)rel;
         if (k0 >= n) k0 = n - 1;
         const float frac = (float)(rel - (double)k0);
-        long k1 = k0 + 1;
-        if (k1 >= n) k1 = 0;   // the loop end runs into its start
         float l0, r0, l1, r1;
-        LoopSample(base, n, xf, k0, l0, r0);
-        LoopSample(base, n, xf, k1, l1, r1);
+        LoopSample(n, xf, xo, k0, l0, r0);
+        LoopSample(n, xf, xo, k0 + 1, l1, r1);   // k0 + 1 = n: what follows the end (the lead)
         const float w = 0.5f - 0.5f * cosf(kTwoPi * ph[g]);
         l += w * (l0 + frac * (l1 - l0));
         r += w * (r0 + frac * (r1 - r0));

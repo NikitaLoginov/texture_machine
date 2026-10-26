@@ -21,10 +21,17 @@ static Motor      motor;          // one tape transport for both channels
 static RecordHead head;           // overdub record head, follows the playhead
 static ControlFilter ctl[8];   // S30..S35, left fader (S36), right fader (S37)
 static SettleFilter  settle[2];  // loop faders: left, right; apply once still
+static Pickup res_pick(0.0f, true);       // S35 normal job: resonance
+static Pickup vol_pick(0.7071f, false);   // S35 while P01 is held: output volume (starts at unity)
 
 static constexpr size_t kMaxSamples = 48000 * 30;   // 30 s per channel
 static float DSY_SDRAM_BSS buf_l[kMaxSamples];
 static float DSY_SDRAM_BSS buf_r[kMaxSamples];
+static float DSY_SDRAM_BSS ovd_l[kMaxSamples];   // overdub track, same positions as the recording
+static float DSY_SDRAM_BSS ovd_r[kMaxSamples];
+static constexpr size_t kOvdPre = 2048;           // overdub track lead-in before sample 0
+static float ovd_pre_l[kOvdPre];
+static float ovd_pre_r[kOvdPre];
 static constexpr size_t kPreRoll = 48000 * 2;       // 2 s input history = lead-in of a recording
 static float DSY_SDRAM_BSS pre_l[2][kPreRoll];      // two rings: one live, one frozen
 static float DSY_SDRAM_BSS pre_r[2][kPreRoll];
@@ -38,6 +45,7 @@ static volatile float range_a = 0.0f, range_b = 1.0f;
 static volatile int   mode = GrainPlayer::FORWARD;
 static volatile float fade_ms = 200.0f, tape_type = 0.33f, res = 0.0f;
 static volatile float age_coef = 1.0f, age_hiss = 0.0f, age_wob = 0.0f, age_wob_pitch = 0.0f;   // overdub aging per pass (S32)
+static volatile float volume = 1.0f;   // output volume, 0 .. 2 (P01 + S35)
 
 // Written by audio callback, read by main loop
 static volatile size_t length = 0;   // recorded samples per channel
@@ -49,6 +57,7 @@ static int     pre_live = 0;      // ring the input is written to
 static size_t  pre_pos = 0;       // next write index in the live ring (= its oldest sample)
 static float   rec_gain = 0.0f;   // overdub write level 0..1, ramps on P11 on/off
 static float   mon_gain = 0.0f;   // input monitor through the tape sound 0..1, ramps like rec_gain
+static float   vol_s = 1.0f;      // smoothed output volume
 static bool    head_ran = false;  // record head ran on the previous sample
 static constexpr float kRecFade = 1.0f / 480.0f;   // overdub crossfade: 10 ms at 48 kHz
 static constexpr float kOverdubKeep = 0.891f;     // overdub: old layers -1 dB per pass
@@ -70,6 +79,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
         head.NewTape();
         pre_live = 1 - pre_live;
         pre_pos = 0;
+        for (size_t j = 0; j < kOvdPre; j++) ovd_pre_l[j] = ovd_pre_r[j] = 0.0f;   // no overdub yet
     }
     if (!rec && was_record) {
         length = rec_pos;
@@ -88,6 +98,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
     motor.SetBattery(battery);
     motor.SetWobble(TapeFormat::Wobble(type));
     head.SetAging(age_coef, age_hiss, age_wob, age_wob_pitch);
+    const float vol = volume;
     const float tape_speed = motor.Process();
     const float deficit    = motor.Deficit();
     player.SetMode((GrainPlayer::Mode)mode);
@@ -109,6 +120,8 @@ void AudioCallback(AudioHandle::InputBuffer in,
             if (rec_pos < kMaxSamples) {
                 buf_l[rec_pos] = in_l;
                 buf_r[rec_pos] = in_r;
+                ovd_l[rec_pos] = 0.0f;   // a new recording has no overdub yet
+                ovd_r[rec_pos] = 0.0f;
                 rec_pos++;
             } else {
                 want_record = false;   // buffer full: auto-stop, finalized next block
@@ -131,7 +144,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
             if (g > 0.0f || (head_ran && head.Pending())) {
                 if (!head_ran) head.Start();   // re-sync to the playhead after a pause
                 head.Process(player.Pos(), player.Step(), player.Bounces(),
-                             player.RegionStart(), player.RegionLen(), player.RegionXfade(),
+                             player.RegionStart(), player.RegionLen(), player.RegionXfade(), player.RegionOvdXfade(), player.RegionLead(),
                              in_l, in_r, g, kOverdubKeep);
                 head_now = true;
             }
@@ -142,8 +155,9 @@ void AudioCallback(AudioHandle::InputBuffer in,
         const float hiss = (e > mon_gain) ? e : mon_gain;
         const float fl = fmt_l.Process(l * e + mon_gain * in_l, hiss);
         const float fr = fmt_r.Process(r * e + mon_gain * in_r, hiss);
-        out[0][i] = fl + (1.0f - mon_gain) * in_l;   // + dry input monitor when not going to tape
-        out[1][i] = fr + (1.0f - mon_gain) * in_r;
+        vol_s += 0.002f * (vol - vol_s);   // smoothed output volume (P01 + S35)
+        out[0][i] = vol_s * (fl + (1.0f - mon_gain) * in_l);   // + dry input monitor when not going to tape
+        out[1][i] = vol_s * (fr + (1.0f - mon_gain) * in_r);
     }
 }
 
@@ -156,6 +170,8 @@ int main(void) {
     for (size_t i = 0; i < kMaxSamples; i++) {
         buf_l[i] = 0.0f;
         buf_r[i] = 0.0f;
+        ovd_l[i] = 0.0f;
+        ovd_r[i] = 0.0f;
     }
     for (size_t i = 0; i < kPreRoll; i++) {
         pre_l[0][i] = pre_l[1][i] = 0.0f;
@@ -163,7 +179,9 @@ int main(void) {
     }
 
     player.Init(buf_l, buf_r, kMaxSamples, hw.AudioSampleRate());
-    head.Init(buf_l, buf_r);
+    player.SetOverdub(ovd_l, ovd_r, ovd_pre_l, ovd_pre_r, kOvdPre);
+    head.Init(buf_l, buf_r, ovd_l, ovd_r, kMaxSamples);
+    head.SetOverdubPreRoll(ovd_pre_l, ovd_pre_r, kOvdPre);
     float sr = hw.AudioSampleRate();
     env.Init(sr);
     env.SetAttackTime(0.01f);    // play/stop declick: 10 ms in, 10 ms out
@@ -195,6 +213,7 @@ int main(void) {
         }
     });
 
+    bool was_vol_mode = false;
     while (1) {
         touch.Process();
         Knobs& k = touch.knobs();
@@ -221,7 +240,17 @@ int main(void) {
         age_wob_pitch = c32 * (0.005f + 0.025f * c34);
         fade_ms  = 10.0f + 1990.0f * c33;             // S33: loop crossfade, 10 ms..2 s
         tape_type = c34;                              // S34: tape type 0 reel-to-reel .. 1 dictaphone
-        float q  = 0.5f + 10.0f * c35;                // S35: filter Q 0.5..10.5
+        // S35 is shared: resonance normally, output volume while P01 is held (pick-up on both).
+        const bool vol_mode = touch.pads().IsTouched(1);
+        if (vol_mode != was_vol_mode) {
+            res_pick.Release();
+            vol_pick.Release();
+            was_vol_mode = vol_mode;
+        }
+        const float c35r = vol_mode ? res_pick.Value() : res_pick.Process(c35);
+        const float c35v = vol_mode ? vol_pick.Process(c35) : vol_pick.Value();
+        volume   = 2.0f * c35v * c35v;                // P01 + S35: mute .. unity (0.71) .. +6 dB
+        float q  = 0.5f + 10.0f * c35r;               // S35: filter Q 0.5..10.5
         float rr = 1.0f - 0.5f / q;                   // Svf resonance giving that Q
         res      = rr * rr * rr * rr;
         range_a  = c36;                               // S36: loop start, applied once the fader stops

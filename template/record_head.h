@@ -11,6 +11,7 @@ public:
     // Lead-in ring (same as GrainPlayer::SetPreRoll): len samples, oldest at index phase.
     void SetPreRoll(float* l, float* r, size_t len, size_t phase);
     bool Pending() const;   // delayed writes still to do: keep calling Process() while true
+    void NewTape() { gen_ = 0.0f; }   // new recording: generation noise starts from zero again
     // Aging of the old layers per pass: one-pole low-pass coefficient (1 = no loss), hiss level,
     // stutter burst chance per written sample and the peak pitch deviation of its jerks (0.01 = 1 %).
     void SetAging(float lp_coef, float hiss, float wob_rate, float wob_pitch)
@@ -41,6 +42,9 @@ private:
     static constexpr long kWobGapMax = 2880;    // steady tape after each jerk of a burst, 0 .. 60 ms
     static constexpr long kBurstMin = 2;        // jerks per burst
     static constexpr long kBurstMax = 6;
+    static constexpr float kGenRamp = 8.0f;     // generation noise fades in over this many passes
+    static constexpr float kNoiseFloor = 0.25f; // generation noise: floor + kNoiseMod x old-layer level
+    static constexpr float kNoiseMod = 3.0f;
     float* buf_l_ = nullptr;
     float* buf_r_ = nullptr;
     double hist_pos_[kLag] = {};                // delayed playhead positions
@@ -71,4 +75,6 @@ private:
     int    dir_ = 1;                                // head direction in the buffer, +1 / -1
     long   wob_left_ = 0, wob_gap_ = 0;             // jerks left in the burst, steady samples before the next
     long   last_k_ = -1;                            // loop sample written last (to spot the wrap)
+    float  env_ = 0.0f;                             // level of the old layers (envelope)
+    float  gen_ = 0.0f;                             // overdub passes since the recording
 };

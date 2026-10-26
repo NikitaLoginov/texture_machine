@@ -48,6 +48,7 @@ static size_t  rec_pos = 0;
 static int     pre_live = 0;      // ring the input is written to
 static size_t  pre_pos = 0;       // next write index in the live ring (= its oldest sample)
 static float   rec_gain = 0.0f;   // overdub write level 0..1, ramps on P11 on/off
+static float   mon_gain = 0.0f;   // input monitor through the tape sound 0..1, ramps like rec_gain
 static bool    head_ran = false;  // record head ran on the previous sample
 static constexpr float kRecFade = 1.0f / 480.0f;   // overdub crossfade: 10 ms at 48 kHz
 static constexpr float kOverdubKeep = 0.891f;     // overdub: old layers -1 dB per pass
@@ -66,6 +67,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
         // The live input history becomes this recording's lead-in; write into the other ring.
         player.SetPreRoll(pre_l[pre_live], pre_r[pre_live], kPreRoll, pre_pos);
         head.SetPreRoll(pre_l[pre_live], pre_r[pre_live], kPreRoll, pre_pos);
+        head.NewTape();
         pre_live = 1 - pre_live;
         pre_pos = 0;
     }
@@ -115,6 +117,9 @@ void AudioCallback(AudioHandle::InputBuffer in,
         float e = env.Process(play);
         // Overdub write level: 10 ms ramp on P11 on/off, times the play/stop declick.
         rec_gain = od ? fminf(rec_gain + kRecFade, 1.0f) : fmaxf(rec_gain - kRecFade, 0.0f);
+        // Input monitor: through the tape sound while the input goes to tape, dry otherwise.
+        const bool to_tape = rec || (od && play);
+        mon_gain = to_tape ? fminf(mon_gain + kRecFade, 1.0f) : fmaxf(mon_gain - kRecFade, 0.0f);
         const float g = rec_gain * e;
         float l = 0.0f, r = 0.0f;
         bool head_now = false;
@@ -132,9 +137,13 @@ void AudioCallback(AudioHandle::InputBuffer in,
             }
         }
         head_ran = head_now;
-        const float fl = fmt_l.Process(l), fr = fmt_r.Process(r);   // tape format character
-        out[0][i] = fl * e + in_l;   // grains (tape format, enveloped) + dry input monitor
-        out[1][i] = fr * e + in_r;
+        // Tape format character on the grains (enveloped) and on the monitored input; its hiss
+        // sounds while the tape plays or the input goes to tape.
+        const float hiss = (e > mon_gain) ? e : mon_gain;
+        const float fl = fmt_l.Process(l * e + mon_gain * in_l, hiss);
+        const float fr = fmt_r.Process(r * e + mon_gain * in_r, hiss);
+        out[0][i] = fl + (1.0f - mon_gain) * in_l;   // + dry input monitor when not going to tape
+        out[1][i] = fr + (1.0f - mon_gain) * in_r;
     }
 }
 

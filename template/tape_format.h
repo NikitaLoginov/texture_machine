@@ -9,7 +9,7 @@ public:
     // deficit: battery weakness 0..1. speed: tape speed factor (the band moves with it).
     // res: low-pass resonance 0..1 (Svf).
     void  SetParams(float type, float deficit, float speed, float res);
-    float Process(float in);
+    float Process(float in, float hiss = 1.0f);   // hiss: 0..1 gain on the tape hiss
     static float Wobble(float type);   // tape wow/flutter depth for Motor::SetWobble
 private:
     daisysp::Svf        hp_, lp_, hiss_lp_;

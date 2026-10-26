@@ -32,10 +32,10 @@ void TapeFormat::SetParams(float type, float deficit, float speed, float res) {
     hiss_lp_.SetRes(0.0074f);   // Q 0.707: flat up to the cutoff
 }
 
-float TapeFormat::Process(float in) {
+float TapeFormat::Process(float in, float hiss) {
     const float x = tanhf(drive_ * in) * norm_;   // saturation with make-up gain
     hp_.Process(x);
     lp_.Process(hp_.High());
-    hiss_lp_.Process(kHissLevel * noise_.Process());
+    hiss_lp_.Process(hiss * kHissLevel * noise_.Process());
     return lp_.Low() + hiss_lp_.Low();
 }

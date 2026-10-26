@@ -231,10 +231,16 @@ void RecordHead::Write(long k, bool bounce, size_t region_start, long region_len
     const float fr = (float)(rd - floor(rd));
     const float old_l = (fr > 0.0f) ? buf_l_[j0] + fr * (buf_l_[j0 + 1] - buf_l_[j0]) : buf_l_[j0];
     const float old_r = (fr > 0.0f) ? buf_r_[j0] + fr * (buf_r_[j0 + 1] - buf_r_[j0]) : buf_r_[j0];
-    // Age the old layers by one tape generation: hiss, then the low-pass (in write order).
+    // Generation noise, baked into the material: it follows the level of the old layers
+    // (5 ms up, 50 ms down) over a quiet floor, and fades in over the first kGenRamp passes.
+    const float lvl = 0.5f * (fabsf(old_l) + fabsf(old_r));
+    env_ += ((lvl > env_) ? 0.004f : 0.0004f) * (lvl - env_);
+    if (gen_ < kGenRamp) gen_ += 1.0f / (float)region_len;
+    const float ramp = (gen_ < kGenRamp) ? gen_ / kGenRamp : 1.0f;
+    const float hiss = age_hiss_ * ramp * (kNoiseFloor + kNoiseMod * env_);
     if (!age_init_) { age_l_ = old_l; age_r_ = old_r; age_init_ = true; }
-    age_l_ += age_coef_ * (old_l + age_hiss_ * Noise() - age_l_);
-    age_r_ += age_coef_ * (old_r + age_hiss_ * Noise() - age_r_);
+    age_l_ += age_coef_ * (old_l + hiss * Noise() - age_l_);
+    age_r_ += age_coef_ * (old_r + hiss * Noise() - age_r_);
     buf_l_[i] = Dub(buf_l_[i], age_l_, x_l, gain, keep);
     buf_r_[i] = Dub(buf_r_[i], age_r_, x_r, gain, keep);
     // Over the crossfade, also write the lead sample the player blends in there (before the
@@ -254,8 +260,8 @@ void RecordHead::Write(long k, bool bounce, size_t region_start, long region_len
     }
     if (l == nullptr) return;
     if (!mage_init_) { mage_l_ = *l; mage_r_ = *r; mage_init_ = true; }
-    mage_l_ += age_coef_ * (*l + age_hiss_ * Noise() - mage_l_);
-    mage_r_ += age_coef_ * (*r + age_hiss_ * Noise() - mage_r_);
+    mage_l_ += age_coef_ * (*l + hiss * Noise() - mage_l_);
+    mage_r_ += age_coef_ * (*r + hiss * Noise() - mage_r_);
     *l = Dub(*l, mage_l_, x_l, gain, keep);
     *r = Dub(*r, mage_r_, x_r, gain, keep);
 }

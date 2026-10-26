@@ -13,9 +13,10 @@ static float Sat(float v)
 }
 
 // One overdub write: crossfade (by gain) from the old value to the limited new layer sum.
-static float Dub(float old, float x, float gain, float keep)
+// aged: the old value after one generation of tape loss.
+static float Dub(float old, float aged, float x, float gain, float keep)
 {
-    return old + gain * (Sat(keep * old + x) - old);
+    return old + gain * (Sat(keep * aged + x) - old);
 }
 
 void RecordHead::Init(float* buf_l, float* buf_r)
@@ -30,6 +31,7 @@ void RecordHead::Start()
     synced_ = false;
     hist_n_ = 0;
     lp_init_ = false;
+    age_init_ = mage_init_ = false;
 }
 
 void RecordHead::SetPreRoll(float* l, float* r, size_t len, size_t phase)
@@ -45,6 +47,14 @@ bool RecordHead::Pending() const
     for (int i = 0; i < hist_n_; i++)
         if (hist_gain_[i] > 0.0f) return true;
     return false;
+}
+
+float RecordHead::Noise()
+{
+    seed_ ^= seed_ << 13;
+    seed_ ^= seed_ >> 17;
+    seed_ ^= seed_ << 5;
+    return (float)(int32_t)seed_ * (1.0f / 2147483648.0f);
 }
 
 void RecordHead::Process(double pos, float step, bool bounce, size_t region_start, size_t region_len,
@@ -172,18 +182,31 @@ void RecordHead::Write(long k, bool bounce, size_t region_start, long region_len
         if (e < 1.0f) gain *= e;
     }
     const size_t i = region_start + (size_t)k;
-    buf_l_[i] = Dub(buf_l_[i], x_l, gain, keep);
-    buf_r_[i] = Dub(buf_r_[i], x_r, gain, keep);
+    // Age the old layers by one tape generation: hiss, then the low-pass (in write order).
+    if (!age_init_) { age_l_ = buf_l_[i]; age_r_ = buf_r_[i]; age_init_ = true; }
+    age_l_ += age_coef_ * (buf_l_[i] + age_hiss_ * Noise() - age_l_);
+    age_r_ += age_coef_ * (buf_r_[i] + age_hiss_ * Noise() - age_r_);
+    buf_l_[i] = Dub(buf_l_[i], age_l_, x_l, gain, keep);
+    buf_r_[i] = Dub(buf_r_[i], age_r_, x_r, gain, keep);
     // Over the crossfade, also write the lead sample the player blends in there (before the
-    // loop start), so the new layer passes the crossfade at full level.
-    if (xf < 1 || k < region_len - xf) return;
+    // loop start), so the new layer passes the crossfade at full level. The lead samples are
+    // a separate sequence with their own aging state, restarted when the head enters the crossfade.
+    if (xf < 1 || k < region_len - xf) { mage_init_ = false; return; }
     const long m = (long)region_start - (region_len - k);
+    float* l = nullptr;
+    float* r = nullptr;
     if (m >= 0) {
-        buf_l_[m] = Dub(buf_l_[m], x_l, gain, keep);
-        buf_r_[m] = Dub(buf_r_[m], x_r, gain, keep);
+        l = &buf_l_[m];
+        r = &buf_r_[m];
     } else if (pre_len_ > 0 && -m <= (long)pre_len_) {
         const size_t j = (size_t)((long)pre_phase_ + (long)pre_len_ + m) % pre_len_;
-        pre_l_[j] = Dub(pre_l_[j], x_l, gain, keep);
-        pre_r_[j] = Dub(pre_r_[j], x_r, gain, keep);
+        l = &pre_l_[j];
+        r = &pre_r_[j];
     }
+    if (l == nullptr) return;
+    if (!mage_init_) { mage_l_ = *l; mage_r_ = *r; mage_init_ = true; }
+    mage_l_ += age_coef_ * (*l + age_hiss_ * Noise() - mage_l_);
+    mage_r_ += age_coef_ * (*r + age_hiss_ * Noise() - mage_r_);
+    *l = Dub(*l, mage_l_, x_l, gain, keep);
+    *r = Dub(*r, mage_r_, x_r, gain, keep);
 }

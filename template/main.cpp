@@ -37,6 +37,7 @@ static volatile float grain_ms = 100.0f, battery = 0.5f;
 static volatile float range_a = 0.0f, range_b = 1.0f;
 static volatile int   mode = GrainPlayer::FORWARD;
 static volatile float fade_ms = 200.0f, tape_type = 0.33f, res = 0.0f;
+static volatile float age_coef = 1.0f, age_hiss = 0.0f;   // overdub aging per pass (S32)
 
 // Written by audio callback, read by main loop
 static volatile size_t length = 0;   // recorded samples per channel
@@ -84,6 +85,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
     const float type = tape_type;
     motor.SetBattery(battery);
     motor.SetWobble(TapeFormat::Wobble(type));
+    head.SetAging(age_coef, age_hiss);
     const float tape_speed = motor.Process();
     const float deficit    = motor.Deficit();
     player.SetMode((GrainPlayer::Mode)mode);
@@ -189,6 +191,7 @@ int main(void) {
         Knobs& k = touch.knobs();
         const float c30 = ctl[0].Process(k.s30());
         const float c31 = ctl[1].Process(k.s31());
+        const float c32 = ctl[2].Process(k.s32());
         const float c33 = ctl[3].Process(k.s33());
         const float c34 = ctl[4].Process(k.s34());
         const float c35 = ctl[5].Process(k.s35());
@@ -197,7 +200,12 @@ int main(void) {
         const float c37 = settle[1].Process(ctl[7].Process(k.RightFader()), now);
         grain_ms = 10.0f * powf(50.0f, c30);          // S30: 10..500 ms, exponential
         battery  = c31;                               // S31: battery 0 dead, 0.5 fresh, 1 over-voltage
-        // S32: unused for now (will set the overdub degradation amount)
+        // S32: overdub aging per pass, scaled by tape type (S34). At S32 = 1 the old layers get a
+        // per-pass low-pass of 8 kHz (reel-to-reel) .. 1.5 kHz (dictaphone); S32 = 0: no aging.
+        const float f_min = 8000.0f * powf(1500.0f / 8000.0f, c34);
+        const float a_min = 1.0f - expf(-6.2831853f * f_min / 48000.0f);
+        age_coef = 1.0f - c32 * (1.0f - a_min);
+        age_hiss = c32 * (0.0003f + 0.0012f * c34);   // per-pass hiss, before the low-pass
         fade_ms  = 10.0f + 1990.0f * c33;             // S33: loop crossfade, 10 ms..2 s
         tape_type = c34;                              // S34: tape type 0 reel-to-reel .. 1 dictaphone
         float q  = 0.5f + 10.0f * c35;                // S35: filter Q 0.5..10.5

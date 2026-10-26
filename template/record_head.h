@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <cstdint>
 
 // Tape-style overdub record head. Follows the GrainPlayer playhead, 8 samples behind it, and
 // writes new = old + gain * (Sat(keep * old + input) - old) into every buffer sample it passes, once per pass.
@@ -10,6 +11,8 @@ public:
     // Lead-in ring (same as GrainPlayer::SetPreRoll): len samples, oldest at index phase.
     void SetPreRoll(float* l, float* r, size_t len, size_t phase);
     bool Pending() const;   // delayed writes still to do: keep calling Process() while true
+    // Aging of the old layers per pass: one-pole low-pass coefficient (1 = no loss) and hiss level.
+    void SetAging(float lp_coef, float hiss) { age_coef_ = lp_coef; age_hiss_ = hiss; }
     // Once per sample while overdubbing, after GrainPlayer::Process().
     // pos: playhead position inside the loop region (0 .. region_len).
     // step: signed distance the playhead moved this sample, before wrap or bounce.
@@ -22,6 +25,7 @@ public:
 private:
     void Write(long k, bool bounce, size_t region_start, long region_len, long xf,
                float x_l, float x_r, float gain, float keep);
+    float Noise();                              // white noise -1 .. 1
     static constexpr int kLag = 8;              // samples behind the playhead
     static constexpr float kEdgeFade = 480.0f;  // ping-pong: write fade near the edges, samples
     float* buf_l_ = nullptr;
@@ -43,4 +47,9 @@ private:
     float  prev_l_ = 0.0f, prev_r_ = 0.0f;      // input at the last step
     float  lp_l_ = 0.0f, lp_r_ = 0.0f;          // input low-pass (follows the tape speed)
     bool   lp_init_ = false;
+    float  age_coef_ = 1.0f, age_hiss_ = 0.0f;  // aging set by SetAging()
+    float  age_l_ = 0.0f, age_r_ = 0.0f;        // aging low-pass state, loop samples
+    float  mage_l_ = 0.0f, mage_r_ = 0.0f;      // aging low-pass state, crossfade lead samples
+    bool   age_init_ = false, mage_init_ = false;
+    uint32_t seed_ = 0x1234567u;                // noise state
 };

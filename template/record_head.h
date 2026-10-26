@@ -11,8 +11,15 @@ public:
     // Lead-in ring (same as GrainPlayer::SetPreRoll): len samples, oldest at index phase.
     void SetPreRoll(float* l, float* r, size_t len, size_t phase);
     bool Pending() const;   // delayed writes still to do: keep calling Process() while true
-    // Aging of the old layers per pass: one-pole low-pass coefficient (1 = no loss) and hiss level.
-    void SetAging(float lp_coef, float hiss) { age_coef_ = lp_coef; age_hiss_ = hiss; }
+    // Aging of the old layers per pass: one-pole low-pass coefficient (1 = no loss), hiss level,
+    // stutter burst chance per written sample and the peak pitch deviation of its jerks (0.01 = 1 %).
+    void SetAging(float lp_coef, float hiss, float wob_rate, float wob_pitch)
+    {
+        age_coef_ = lp_coef;
+        age_hiss_ = hiss;
+        wob_rate_ = wob_rate;
+        wob_pitch_ = wob_pitch;
+    }
     // Once per sample while overdubbing, after GrainPlayer::Process().
     // pos: playhead position inside the loop region (0 .. region_len).
     // step: signed distance the playhead moved this sample, before wrap or bounce.
@@ -26,8 +33,14 @@ private:
     void Write(long k, bool bounce, size_t region_start, long region_len, long xf,
                float x_l, float x_r, float gain, float keep);
     float Noise();                              // white noise -1 .. 1
+    double Wobble(long k, long region_len, long xf);   // printed-wobble read offset for loop sample k
     static constexpr int kLag = 8;              // samples behind the playhead
     static constexpr float kEdgeFade = 480.0f;  // ping-pong: write fade near the edges, samples
+    static constexpr long kWobMin = 1440;       // stutter jerk length 30 .. 150 ms, buffer samples
+    static constexpr long kWobMax = 7200;
+    static constexpr long kWobGapMax = 2880;    // steady tape after each jerk of a burst, 0 .. 60 ms
+    static constexpr long kBurstMin = 2;        // jerks per burst
+    static constexpr long kBurstMax = 6;
     float* buf_l_ = nullptr;
     float* buf_r_ = nullptr;
     double hist_pos_[kLag] = {};                // delayed playhead positions
@@ -52,4 +65,10 @@ private:
     float  mage_l_ = 0.0f, mage_r_ = 0.0f;      // aging low-pass state, crossfade lead samples
     bool   age_init_ = false, mage_init_ = false;
     uint32_t seed_ = 0x1234567u;                // noise state
+    float  wob_rate_ = 0.0f, wob_pitch_ = 0.0f;     // wobble event chance per sample, peak pitch deviation
+    long   wob_len_ = 0, wob_pos_ = 0;              // current wobble event length (0 = none) and position
+    double wob_reach_ = 0.0;                        // its peak read-ahead, samples
+    int    dir_ = 1;                                // head direction in the buffer, +1 / -1
+    long   wob_left_ = 0, wob_gap_ = 0;             // jerks left in the burst, steady samples before the next
+    long   last_k_ = -1;                            // loop sample written last (to spot the wrap)
 };

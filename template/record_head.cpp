@@ -32,6 +32,8 @@ void RecordHead::Start()
     hist_n_ = 0;
     lp_init_ = false;
     age_init_ = mage_init_ = false;
+    wob_len_ = wob_left_ = wob_gap_ = 0;
+    last_k_ = -1;
 }
 
 void RecordHead::SetPreRoll(float* l, float* r, size_t len, size_t phase)
@@ -55,6 +57,37 @@ float RecordHead::Noise()
     seed_ ^= seed_ >> 17;
     seed_ ^= seed_ << 5;
     return (float)(int32_t)seed_ * (1.0f / 2147483648.0f);
+}
+
+// Printed tape stutter on the old layers: steady tape, then at random (wob_rate_ chance per
+// written sample) a burst of kBurstMin..kBurstMax jerks. Each jerk reads the old content ahead
+// of the head by a short sin^2 bump (pitch quickly up and back, peak up to wob_pitch_), followed
+// by a short stretch of steady tape. A jerk only starts if it stays inside the loop, away from
+// the edges and the crossfade (the read stays on not-yet-written samples); else the burst ends.
+double RecordHead::Wobble(long k, long region_len, long xf)
+{
+    if (wob_len_ == 0) {
+        if (wob_left_ > 0) {
+            if (wob_gap_ > 0) { wob_gap_--; return 0.0; }
+        } else {
+            if (0.5f + 0.5f * Noise() >= wob_rate_) return 0.0;
+            wob_left_ = kBurstMin + (long)((0.5f + 0.5f * Noise()) * (float)(kBurstMax - kBurstMin + 1));
+        }
+        const long len = kWobMin + (long)((0.5f + 0.5f * Noise()) * (float)(kWobMax - kWobMin));
+        const double reach = (double)(wob_pitch_ * (0.5f + 0.5f * Noise())) * (double)len / 3.14159265;
+        const long lo = (long)kEdgeFade;
+        const long hi = region_len - xf - (long)kEdgeFade;
+        const long end = k + dir_ * (len + (long)reach + 2);
+        if (k < lo || k >= hi || end < lo || end >= hi) { wob_left_ = 0; return 0.0; }
+        wob_len_ = len;
+        wob_pos_ = 0;
+        wob_reach_ = reach;
+        wob_left_--;
+        wob_gap_ = (long)((0.5f + 0.5f * Noise()) * (float)kWobGapMax);
+    }
+    const double w = sin(3.14159265 * (double)wob_pos_ / (double)wob_len_);
+    if (++wob_pos_ >= wob_len_) wob_len_ = 0;
+    return (double)dir_ * wob_reach_ * w * w;
 }
 
 void RecordHead::Process(double pos, float step, bool bounce, size_t region_start, size_t region_len,
@@ -147,6 +180,7 @@ void RecordHead::Process(double pos, float step, bool bounce, size_t region_star
         first = (long)ceil(from_ - 0.5) - 1;
         count = first - (long)ceil(to - 0.5) + 1;
     }
+    dir_ = (dir > 0) ? 1 : -1;
     for (long i = 0; i < count; i++) {
         const long k = first + i * dir;
         // Input at the moment the head crosses k + 0.5 (interpolated across this step).
@@ -181,11 +215,26 @@ void RecordHead::Write(long k, bool bounce, size_t region_start, long region_len
         const float e = ((float)dist + 0.5f) / kEdgeFade;
         if (e < 1.0f) gain *= e;
     }
+    // At the loop wrap the aging low-pass continues from what is heard just before it: forward
+    // (end -> start) the start continues from the crossfade lead, backward (start -> end) the
+    // lead continues from the start. Without this the filter prints a step at the wrap.
+    if (dir_ > 0 && k < last_k_ - 1 && mage_init_) {
+        age_l_ = mage_l_; age_r_ = mage_r_; age_init_ = true;
+    } else if (dir_ < 0 && k > last_k_ + 1 && age_init_) {
+        mage_l_ = age_l_; mage_r_ = age_r_; mage_init_ = true;
+    }
+    last_k_ = k;
     const size_t i = region_start + (size_t)k;
+    // Old layers as read with the printed wobble: at k, or a little ahead of it (interpolated).
+    const double rd = (double)k + Wobble(k, region_len, xf);
+    const size_t j0 = region_start + (size_t)rd;
+    const float fr = (float)(rd - floor(rd));
+    const float old_l = (fr > 0.0f) ? buf_l_[j0] + fr * (buf_l_[j0 + 1] - buf_l_[j0]) : buf_l_[j0];
+    const float old_r = (fr > 0.0f) ? buf_r_[j0] + fr * (buf_r_[j0 + 1] - buf_r_[j0]) : buf_r_[j0];
     // Age the old layers by one tape generation: hiss, then the low-pass (in write order).
-    if (!age_init_) { age_l_ = buf_l_[i]; age_r_ = buf_r_[i]; age_init_ = true; }
-    age_l_ += age_coef_ * (buf_l_[i] + age_hiss_ * Noise() - age_l_);
-    age_r_ += age_coef_ * (buf_r_[i] + age_hiss_ * Noise() - age_r_);
+    if (!age_init_) { age_l_ = old_l; age_r_ = old_r; age_init_ = true; }
+    age_l_ += age_coef_ * (old_l + age_hiss_ * Noise() - age_l_);
+    age_r_ += age_coef_ * (old_r + age_hiss_ * Noise() - age_r_);
     buf_l_[i] = Dub(buf_l_[i], age_l_, x_l, gain, keep);
     buf_r_[i] = Dub(buf_r_[i], age_r_, x_r, gain, keep);
     // Over the crossfade, also write the lead sample the player blends in there (before the

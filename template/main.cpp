@@ -37,7 +37,7 @@ static volatile float grain_ms = 100.0f, battery = 0.5f;
 static volatile float range_a = 0.0f, range_b = 1.0f;
 static volatile int   mode = GrainPlayer::FORWARD;
 static volatile float fade_ms = 200.0f, tape_type = 0.33f, res = 0.0f;
-static volatile float age_coef = 1.0f, age_hiss = 0.0f;   // overdub aging per pass (S32)
+static volatile float age_coef = 1.0f, age_hiss = 0.0f, age_wob = 0.0f, age_wob_pitch = 0.0f;   // overdub aging per pass (S32)
 
 // Written by audio callback, read by main loop
 static volatile size_t length = 0;   // recorded samples per channel
@@ -85,7 +85,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
     const float type = tape_type;
     motor.SetBattery(battery);
     motor.SetWobble(TapeFormat::Wobble(type));
-    head.SetAging(age_coef, age_hiss);
+    head.SetAging(age_coef, age_hiss, age_wob, age_wob_pitch);
     const float tape_speed = motor.Process();
     const float deficit    = motor.Deficit();
     player.SetMode((GrainPlayer::Mode)mode);
@@ -206,6 +206,10 @@ int main(void) {
         const float a_min = 1.0f - expf(-6.2831853f * f_min / 48000.0f);
         age_coef = 1.0f - c32 * (1.0f - a_min);
         age_hiss = c32 * (0.0003f + 0.0012f * c34);   // per-pass hiss, before the low-pass
+        // Printed stutter bursts per written sample: S32 x 0.15/s (reel-to-reel) .. S32 x 1.5/s
+        // (dictaphone); each jerk peaks at up to S32 x 0.5 % .. S32 x 3 % pitch.
+        age_wob = c32 * 0.15f * powf(10.0f, c34) / 48000.0f;
+        age_wob_pitch = c32 * (0.005f + 0.025f * c34);
         fade_ms  = 10.0f + 1990.0f * c33;             // S33: loop crossfade, 10 ms..2 s
         tape_type = c34;                              // S34: tape type 0 reel-to-reel .. 1 dictaphone
         float q  = 0.5f + 10.0f * c35;                // S35: filter Q 0.5..10.5

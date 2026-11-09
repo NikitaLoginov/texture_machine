@@ -42,7 +42,7 @@ static float DSY_SDRAM_BSS pre_r[2][kPreRoll];
 static volatile bool  want_play    = false;
 static volatile bool  want_record  = false;
 static volatile bool  want_overdub = false;
-static volatile float grain_ms = 100.0f, battery = 0.5f;
+static volatile float battery = 0.5f;
 static volatile float range_a = 0.0f, range_b = 1.0f;
 static volatile int   mode = GrainPlayer::FORWARD;
 static volatile float fade_ms = 200.0f, tape_type = 0.33f;
@@ -151,7 +151,6 @@ void AudioCallback(AudioHandle::InputBuffer in,
     player.SetSpeed(tape_speed);
     // Varispeed: pitch follows tape speed (grains read at the tape speed, so they ride the playhead).
     player.SetRatio(tape_speed);
-    player.SetGrainMs(grain_ms);
     player.SetRange(range_a, range_b);
     player.SetFadeMs(fade_ms);
     const float drv = drive, bump_amt = bump;
@@ -354,6 +353,7 @@ int main(void) {
 
     player.Init(buf_l, buf_r, kMaxSamples, hw.AudioSampleRate());
     player.SetOverdub(ovd_l, ovd_r, ovd_pre_l, ovd_pre_r, kOvdPre);
+    player.SetGrainMs(100.0f);   // fixed: it only sets how long blends take at loop changes and ping-pong turns
     head.Init(buf_l, buf_r, ovd_l, ovd_r, kMaxSamples);
     head.SetOverdubPreRoll(ovd_pre_l, ovd_pre_r, kOvdPre);
     float sr = hw.AudioSampleRate();
@@ -396,7 +396,6 @@ int main(void) {
     while (1) {
         touch.Process();
         Knobs& k = touch.knobs();
-        const float c30 = ctl[0].Process(k.s30());
         const float c31 = ctl[1].Process(k.s31());
         const float c32 = ctl[2].Process(k.s32());
         const float c33 = ctl[3].Process(k.s33());
@@ -405,7 +404,7 @@ int main(void) {
         const uint32_t now = System::GetNow();
         const float c36 = settle[0].Process(ctl[6].Process(k.LeftFader()), now);
         const float c37 = settle[1].Process(ctl[7].Process(k.RightFader()), now);
-        grain_ms = 10.0f * powf(50.0f, c30);          // S30: 10..500 ms, exponential
+        // S30: free (plan step 1.4).
         battery  = c31;                               // S31: battery 0 dead, 0.5 fresh, 1 over-voltage
         SetAgingFrom(c32, c34);                       // S32: overdub aging per pass, scaled by tape type (S34)
         fade_ms  = 10.0f + 1990.0f * c33;             // S33: loop crossfade, 10 ms..2 s

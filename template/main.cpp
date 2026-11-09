@@ -7,6 +7,7 @@
 #include "tape_format.h"
 #include "record_head.h"
 #include "fast_math.h"
+#include "tilt_eq.h"
 #include <cmath>
 
 using namespace daisy;
@@ -18,6 +19,7 @@ static Touch       touch;
 static GrainPlayer player;
 static Adsr env;
 static TapeFormat fmt_l, fmt_r;   // tape type character per channel
+static TiltEq     tilt_l, tilt_r; // S30: tone tilt on the device output
 static Motor      motor;          // one tape transport for both channels
 static RecordHead head;           // overdub record head, follows the playhead
 static ControlFilter ctl[8];   // S30..S35, left fader (S36), right fader (S37)
@@ -48,6 +50,7 @@ static volatile int   mode = GrainPlayer::FORWARD;
 static volatile float fade_ms = 200.0f, tape_type = 0.33f;
 static volatile float drive = 1.0f;    // S35: multiplier on the tape saturation drive, 0.5 .. 4
 static volatile float bump = 0.0f;     // S35 right of middle: head bump amount 0 .. 1
+static volatile float tilt = 0.0f;     // S30: tilt EQ, -1 darker .. 0 flat .. 1 brighter
 static volatile float age_coef = 1.0f, age_hiss = 0.0f, age_wob = 0.0f, age_wob_pitch = 0.0f;   // overdub aging per pass (S32)
 static volatile float volume = 1.0f;   // output volume, 0 .. 2 (P01 + S35)
 // Right switch = overdub mode: up = aging + volume drop per pass, center = aging only, down = aging
@@ -156,6 +159,9 @@ void AudioCallback(AudioHandle::InputBuffer in,
     const float drv = drive, bump_amt = bump;
     fmt_l.SetParams(type, deficit, tape_speed, drv, bump_amt);
     fmt_r.SetParams(type, deficit, tape_speed, drv, bump_amt);
+    const float tl = tilt;
+    tilt_l.SetTilt(tl);
+    tilt_r.SetTilt(tl);
 
     for (size_t i = 0; i < size; i++) {
         float in_l = in[0][i], in_r = in[1][i];
@@ -204,8 +210,8 @@ void AudioCallback(AudioHandle::InputBuffer in,
         // sounds while the tape plays or the input goes to tape.
         const float hiss = (e > mon_gain) ? e : mon_gain;
         PROF_BEGIN(t_tape);
-        const float fl = fmt_l.Process(l * e + mon_gain * in_l, hiss);
-        const float fr = fmt_r.Process(r * e + mon_gain * in_r, hiss);
+        const float fl = tilt_l.Process(fmt_l.Process(l * e + mon_gain * in_l, hiss));
+        const float fr = tilt_r.Process(fmt_r.Process(r * e + mon_gain * in_r, hiss));
         PROF_END(kProfTape, t_tape);
         vol_s += 0.002f * (vol - vol_s);   // smoothed output volume (P01 + S35)
         mix_s += 0.002f * (mixv - mix_s);
@@ -364,6 +370,8 @@ int main(void) {
     env.SetSustainLevel(1.0f);
     fmt_l.Init(sr, 1);
     fmt_r.Init(sr, 0x2545F491);   // different seed: independent hiss per channel
+    tilt_l.Init(sr);
+    tilt_r.Init(sr);
     motor.Init(hw.AudioCallbackRate());
     touch.Init(hw);
 #ifdef CPU_TEST
@@ -404,7 +412,9 @@ int main(void) {
         const uint32_t now = System::GetNow();
         const float c36 = settle[0].Process(ctl[6].Process(k.LeftFader()), now);
         const float c37 = settle[1].Process(ctl[7].Process(k.RightFader()), now);
-        // S30: free (plan step 1.4).
+        // S30: tilt EQ on the device output, left darker .. middle flat .. right brighter.
+        const float t30 = 2.0f * ctl[0].Process(k.s30()) - 1.0f;
+        tilt     = (fabsf(t30) < 0.03f) ? 0.0f : t30;   // small dead zone: the middle is exactly flat
         battery  = c31;                               // S31: battery 0 dead, 0.5 fresh, 1 over-voltage
         SetAgingFrom(c32, c34);                       // S32: overdub aging per pass, scaled by tape type (S34)
         fade_ms  = 10.0f + 1990.0f * c33;             // S33: loop crossfade, 10 ms..2 s

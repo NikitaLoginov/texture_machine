@@ -22,7 +22,7 @@ static Motor      motor;          // one tape transport for both channels
 static RecordHead head;           // overdub record head, follows the playhead
 static ControlFilter ctl[8];   // S30..S35, left fader (S36), right fader (S37)
 static SettleFilter  settle[2];  // loop faders: left, right; apply once still
-static Pickup res_pick(0.0f, true);       // S35 normal job: resonance
+static Pickup drive_pick(0.5f, true);     // S35 normal job: drive
 static Pickup vol_pick(0.7071f, false);   // S35 while P01 is held: output volume (starts at unity)
 static Pickup mix_pick(0.5f, false);      // S35 while P01 is held, right switch down: device / input mix
 
@@ -45,7 +45,9 @@ static volatile bool  want_overdub = false;
 static volatile float grain_ms = 100.0f, battery = 0.5f;
 static volatile float range_a = 0.0f, range_b = 1.0f;
 static volatile int   mode = GrainPlayer::FORWARD;
-static volatile float fade_ms = 200.0f, tape_type = 0.33f, res = 0.0f;
+static volatile float fade_ms = 200.0f, tape_type = 0.33f;
+static volatile float drive = 1.0f;    // S35: multiplier on the tape saturation drive, 0.5 .. 4
+static volatile float bump = 0.0f;     // S35 right of middle: head bump amount 0 .. 1
 static volatile float age_coef = 1.0f, age_hiss = 0.0f, age_wob = 0.0f, age_wob_pitch = 0.0f;   // overdub aging per pass (S32)
 static volatile float volume = 1.0f;   // output volume, 0 .. 2 (P01 + S35)
 // Right switch = overdub mode: up = aging + volume drop per pass, center = aging only, down = aging
@@ -152,8 +154,9 @@ void AudioCallback(AudioHandle::InputBuffer in,
     player.SetGrainMs(grain_ms);
     player.SetRange(range_a, range_b);
     player.SetFadeMs(fade_ms);
-    fmt_l.SetParams(type, deficit, tape_speed, res);
-    fmt_r.SetParams(type, deficit, tape_speed, res);
+    const float drv = drive, bump_amt = bump;
+    fmt_l.SetParams(type, deficit, tape_speed, drv, bump_amt);
+    fmt_r.SetParams(type, deficit, tape_speed, drv, bump_amt);
 
     for (size_t i = 0; i < size; i++) {
         float in_l = in[0][i], in_r = in[1][i];
@@ -413,24 +416,25 @@ int main(void) {
         keep = (osw == Switch3::POS_UP) ? kOverdubKeep : 1.0f;
         const bool mixing = (osw == Switch3::POS_DOWN);
         mix_mode = mixing;
-        // S35 is shared: resonance normally; while P01 is held, output volume (or the mix with the
+        // S35 is shared: drive normally; while P01 is held, output volume (or the mix with the
         // right switch down). Pick-up on all jobs.
         const bool vol_mode = touch.pads().IsTouched(1);
         if (vol_mode != was_vol_mode || mixing != was_mixing) {
-            res_pick.Release();
+            drive_pick.Release();
             vol_pick.Release();
             mix_pick.Release();
             was_vol_mode = vol_mode;
             was_mixing = mixing;
         }
-        const float c35r = vol_mode ? res_pick.Value() : res_pick.Process(c35);
+        const float c35d = vol_mode ? drive_pick.Value() : drive_pick.Process(c35);
         const float c35v = (vol_mode && !mixing) ? vol_pick.Process(c35) : vol_pick.Value();
         const float c35m = (vol_mode && mixing) ? mix_pick.Process(c35) : mix_pick.Value();
         volume   = 2.0f * c35v * c35v;                // P01 + S35: mute .. unity (0.71) .. +6 dB
         mix      = c35m;                              // P01 + S35, switch down: device (0) .. dry input (1)
-        float q  = 0.5f + 10.0f * c35r;               // S35: filter Q 0.5..10.5
-        float rr = 1.0f - 0.5f / q;                   // Svf resonance giving that Q
-        res      = rr * rr * rr * rr;
+        // S35: drive, times the drive from tape type and battery: 0.5x .. 1x (middle, as before) .. 4x.
+        drive    = (c35d < 0.5f) ? 0.5f * powf(2.0f, 2.0f * c35d) : powf(4.0f, 2.0f * (c35d - 0.5f));
+        // ...and right of the middle a head bump grows with it (0 .. +9 dB); middle = no bump, as before.
+        bump     = (c35d > 0.5f) ? 2.0f * (c35d - 0.5f) : 0.0f;
         range_a  = c36;                               // S36: loop start, applied once the fader stops
         range_b  = c37;                               // S37: loop end, relative: share of the rest after the start; applied once the fader stops
         int sw = touch.switches().A();                    // left switch: play mode

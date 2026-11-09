@@ -10,7 +10,7 @@ public:
     void SetRange(float a, float b);   // loop start a (0..1 of length), b = loop length as 0..1 of the rest after the start; applied through the loop crossfade at the next wrap (see Process), or on Reset()
     void SetMode(Mode mode);
     void SetSpeed(float speed);        // playhead speed, 1 = normal, 0 = freeze, clamp to >= 0
-    void SetPitch(float semitones);    // grain transposition, clamp -36..36
+    void SetRatio(float ratio);        // grain read speed (pitch), clamp 1/8..8 (+-36 semitones)
     void SetGrainMs(float ms);         // grain length in ms, clamp 5..1000
     void SetFadeMs(float ms);          // loop crossfade length, clamp 1..2000
 
@@ -42,6 +42,7 @@ private:
     long Xfade(long n) const;
     void Lead(long m, float& out_l, float& out_r) const;
     void LoopSample(long n, long xf, long xo, long k, float& out_l, float& out_r) const;
+    void ReadAt(double rel, long n, long xf, long xo, float& out_l, float& out_r) const;
     long OvdXfade(long n) const;
     void OvdLead(long m, float& out_l, float& out_r) const;
     static constexpr long kOvdXfade = 480;   // overdub track seam at the loop end, samples (10 ms)

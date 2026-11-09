@@ -76,6 +76,7 @@ private:
     long   hist_lead_[kLag] = {};               // crossfade lead of each delayed position
     float  hist_gain_[kLag] = {};               // write gain of each delayed position
     int    hist_n_ = 0;                         // filled history entries, 0 .. kLag
+    int    hist_i_ = 0;                         // oldest entry once full (ring)
     bool   synced_ = false;
     double from_ = 0.0;                         // head position after the last step
     long   start_ = 0, len_ = 0;                // loop the head was in at from_

@@ -1,4 +1,5 @@
 #include "tape_format.h"
+#include "fast_math.h"
 #include <cmath>
 using namespace daisysp;
 
@@ -33,7 +34,7 @@ void TapeFormat::SetParams(float type, float deficit, float speed, float res) {
 }
 
 float TapeFormat::Process(float in, float hiss) {
-    const float x = tanhf(drive_ * in) * norm_;   // saturation with make-up gain
+    const float x = FastTanh(drive_ * in) * norm_;   // saturation with make-up gain
     hp_.Process(x);
     lp_.Process(hp_.High());
     hiss_lp_.Process(hiss * kHissLevel * noise_.Process());

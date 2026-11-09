@@ -1,4 +1,5 @@
 #include "record_head.h"
+#include "fast_math.h"
 #include <cmath>
 
 // Soft limit on what is written: unchanged below kKnee, then bends smoothly toward 1.0.
@@ -8,7 +9,7 @@ static float Sat(float v)
 {
     const float a = fabsf(v);
     if (a <= kKnee) return v;
-    const float y = kKnee + (1.0f - kKnee) * tanhf((a - kKnee) / (1.0f - kKnee));
+    const float y = kKnee + (1.0f - kKnee) * FastTanh((a - kKnee) / (1.0f - kKnee));
     return (v < 0.0f) ? -y : y;
 }
 
@@ -125,7 +126,8 @@ void RecordHead::Process(double pos, float step, bool bounce, size_t region_star
                          long xfade, long ovd_xfade, size_t lead, float in_l, float in_r, float gain, float keep)
 {
     if (region_len < 2) return;
-    // Delay the playhead, the loop it is in and the write gain by kLag samples.
+    // Delay the playhead, the loop it is in and the write gain by kLag samples (a ring: hist_i_ is
+    // the oldest entry, which is read and then replaced by the newest).
     if (hist_n_ < kLag) {
         hist_pos_[hist_n_] = pos;
         hist_step_[hist_n_] = step;
@@ -136,34 +138,27 @@ void RecordHead::Process(double pos, float step, bool bounce, size_t region_star
         hist_lead_[hist_n_] = (long)lead;
         hist_gain_[hist_n_] = gain;
         hist_n_++;
+        hist_i_ = 0;
         return;
     }
-    const double p = hist_pos_[0];
-    const float  s = hist_step_[0];
-    const long   rs = hist_start_[0];
-    const long   rl = hist_len_[0];
-    const long   xf = hist_xf_[0];
-    const long   xo = hist_xo_[0];
-    const long   ld = hist_lead_[0];
-    const float  g = hist_gain_[0];
-    for (int i = 0; i < kLag - 1; i++) {
-        hist_pos_[i] = hist_pos_[i + 1];
-        hist_step_[i] = hist_step_[i + 1];
-        hist_start_[i] = hist_start_[i + 1];
-        hist_len_[i] = hist_len_[i + 1];
-        hist_xf_[i] = hist_xf_[i + 1];
-        hist_xo_[i] = hist_xo_[i + 1];
-        hist_lead_[i] = hist_lead_[i + 1];
-        hist_gain_[i] = hist_gain_[i + 1];
-    }
-    hist_pos_[kLag - 1] = pos;
-    hist_step_[kLag - 1] = step;
-    hist_start_[kLag - 1] = (long)region_start;
-    hist_len_[kLag - 1] = (long)region_len;
-    hist_xf_[kLag - 1] = xfade;
-    hist_xo_[kLag - 1] = ovd_xfade;
-    hist_lead_[kLag - 1] = (long)lead;
-    hist_gain_[kLag - 1] = gain;
+    const int h = hist_i_;
+    const double p = hist_pos_[h];
+    const float  s = hist_step_[h];
+    const long   rs = hist_start_[h];
+    const long   rl = hist_len_[h];
+    const long   xf = hist_xf_[h];
+    const long   xo = hist_xo_[h];
+    const long   ld = hist_lead_[h];
+    const float  g = hist_gain_[h];
+    hist_pos_[h] = pos;
+    hist_step_[h] = step;
+    hist_start_[h] = (long)region_start;
+    hist_len_[h] = (long)region_len;
+    hist_xf_[h] = xfade;
+    hist_xo_[h] = ovd_xfade;
+    hist_lead_[h] = (long)lead;
+    hist_gain_[h] = gain;
+    if (++hist_i_ >= kLag) hist_i_ = 0;
 
     // Input low-pass, coefficient = tape speed (anti-aliasing when the tape runs slow).
     const float a = (fabsf(s) < 1.0f) ? fabsf(s) : 1.0f;
@@ -292,9 +287,9 @@ void RecordHead::Write(long k, bool bounce, size_t region_start, long region_len
     // sin into the lead before the start (the player blends them equal-power).
     float in_end = 1.0f, in_lead = 0.0f;
     if (xo >= 1 && k >= region_len - xo) {
-        const float u = 1.5707963f * (float)(k - (region_len - xo)) / (float)xo;
-        in_end = cosf(u);
-        in_lead = sinf(u);
+        const float u = (float)(k - (region_len - xo)) / (float)xo;
+        in_end = FastSinHalfPi(1.0f - u);   // same curves as the player's read
+        in_lead = FastSinHalfPi(u);
     }
     for (int n = 0; n < 2; n++) {
         Track& t = trk_[n];
@@ -324,7 +319,7 @@ void RecordHead::Write(long k, bool bounce, size_t region_start, long region_len
         float mg = gain;
         float xm = 0.0f;
         if (k < region_len - xz) {
-            const float sw = sinf(1.5707963f * (float)(k - (region_len - xz - kTail)) / (float)kTail);
+            const float sw = FastSinHalfPi((float)(k - (region_len - xz - kTail)) / (float)kTail);
             mg *= sw * sw;
         } else if (n == 1) {
             xm = in_lead;

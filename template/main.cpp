@@ -6,6 +6,7 @@
 #include "motor.h"
 #include "tape_format.h"
 #include "record_head.h"
+#include "fast_math.h"
 #include <cmath>
 
 using namespace daisy;
@@ -23,6 +24,7 @@ static ControlFilter ctl[8];   // S30..S35, left fader (S36), right fader (S37)
 static SettleFilter  settle[2];  // loop faders: left, right; apply once still
 static Pickup res_pick(0.0f, true);       // S35 normal job: resonance
 static Pickup vol_pick(0.7071f, false);   // S35 while P01 is held: output volume (starts at unity)
+static Pickup mix_pick(0.5f, false);      // S35 while P01 is held, right switch down: device / input mix
 
 static constexpr size_t kMaxSamples = 48000 * 30;   // 30 s per channel
 static float DSY_SDRAM_BSS buf_l[kMaxSamples];
@@ -46,6 +48,11 @@ static volatile int   mode = GrainPlayer::FORWARD;
 static volatile float fade_ms = 200.0f, tape_type = 0.33f, res = 0.0f;
 static volatile float age_coef = 1.0f, age_hiss = 0.0f, age_wob = 0.0f, age_wob_pitch = 0.0f;   // overdub aging per pass (S32)
 static volatile float volume = 1.0f;   // output volume, 0 .. 2 (P01 + S35)
+// Right switch = overdub mode: up = aging + volume drop per pass, center = aging only, down = aging
+// only and P01 + S35 mixes the device output (0) with the dry input (1).
+static volatile float keep = 0.891f;   // share of the old layers kept per pass (1 = no drop)
+static volatile bool  mix_mode = false;
+static volatile float mix = 0.5f;      // device / dry input mix in mix_mode, 0 .. 1
 
 // Written by audio callback, read by main loop
 static volatile size_t length = 0;   // recorded samples per channel
@@ -58,13 +65,47 @@ static size_t  pre_pos = 0;       // next write index in the live ring (= its ol
 static float   rec_gain = 0.0f;   // overdub write level 0..1, ramps on P11 on/off
 static float   mon_gain = 0.0f;   // input monitor through the tape sound 0..1, ramps like rec_gain
 static float   vol_s = 1.0f;      // smoothed output volume
+static float   mix_s = 0.5f;      // smoothed device / input mix
+static float   mixmode_s = 0.0f;  // 0 = normal output, 1 = mix output; 10 ms ramp between them
 static bool    head_ran = false;  // record head ran on the previous sample
 static constexpr float kRecFade = 1.0f / 480.0f;   // overdub crossfade: 10 ms at 48 kHz
-static constexpr float kOverdubKeep = 0.891f;     // overdub: old layers -1 dB per pass
+static constexpr float kOverdubKeep = 0.891f;     // overdub: old layers -1 dB per pass (switch up)
+
+#ifdef CPU_TEST
+static CpuLoadMeter cpu;   // audio callback load, CPU stress test only
+// Cycles spent per part of the callback, per block (cycle counter), for the CPU test's breakdown.
+enum { kProfGrains, kProfHead, kProfTape, kProfBlock, kProfCount };
+static volatile bool prof_reset = true;   // set by the test loop, cleared by the callback
+static uint64_t prof_sum[kProfCount];
+static uint32_t prof_max[kProfCount], prof_blocks;
+#define PROF_BEGIN(t) const uint32_t t = DWT->CYCCNT
+#define PROF_END(part, t) prof_now[part] += DWT->CYCCNT - t
+#else
+#define PROF_BEGIN(t)
+#define PROF_END(part, t)
+#endif
+
+// S32: overdub aging per pass, scaled by tape type. At amount = 1 the old layers get a per-pass
+// low-pass of 8 kHz (reel-to-reel) .. 1.5 kHz (dictaphone); amount = 0: no aging.
+static void SetAgingFrom(float amount, float type) {
+    const float f_min = 8000.0f * powf(1500.0f / 8000.0f, type);
+    const float a_min = 1.0f - expf(-6.2831853f * f_min / 48000.0f);
+    age_coef = 1.0f - amount * (1.0f - a_min);
+    age_hiss = amount * (0.0003f + 0.0012f * type);   // per-pass hiss, before the low-pass
+    // Printed stutter bursts per written sample: amount x 0.15/s (reel-to-reel) .. amount x
+    // 1.5/s (dictaphone); each jerk peaks at up to amount x 0.5 % .. amount x 3 % pitch.
+    age_wob = amount * 0.15f * powf(10.0f, type) / 48000.0f;
+    age_wob_pitch = amount * (0.005f + 0.025f * type);
+}
 
 void AudioCallback(AudioHandle::InputBuffer in,
                    AudioHandle::OutputBuffer out,
                    size_t size) {
+#ifdef CPU_TEST
+    cpu.OnBlockStart();
+    const uint32_t prof_block = DWT->CYCCNT;
+    uint32_t prof_now[kProfCount] = {};
+#endif
     // 1. Copy flags into locals
     bool play = want_play;
     bool rec  = want_record;
@@ -99,12 +140,15 @@ void AudioCallback(AudioHandle::InputBuffer in,
     motor.SetWobble(TapeFormat::Wobble(type));
     head.SetAging(age_coef, age_hiss, age_wob, age_wob_pitch);
     const float vol = volume;
+    const float kp = keep;
+    const float mixv = mix;
+    const float mixmode = mix_mode ? 1.0f : 0.0f;
     const float tape_speed = motor.Process();
     const float deficit    = motor.Deficit();
     player.SetMode((GrainPlayer::Mode)mode);
     player.SetSpeed(tape_speed);
-    // Varispeed: pitch follows tape speed.
-    player.SetPitch(12.0f * log2f(tape_speed > 0.01f ? tape_speed : 0.01f));
+    // Varispeed: pitch follows tape speed (grains read at the tape speed, so they ride the playhead).
+    player.SetRatio(tape_speed);
     player.SetGrainMs(grain_ms);
     player.SetRange(range_a, range_b);
     player.SetFadeMs(fade_ms);
@@ -137,15 +181,19 @@ void AudioCallback(AudioHandle::InputBuffer in,
         float l = 0.0f, r = 0.0f;
         bool head_now = false;
         if ((play || env.IsRunning()) && !rec) {
+            PROF_BEGIN(t_grains);
             player.Process(l, r);
+            PROF_END(kProfGrains, t_grains);
             // Overdub: the record head follows the playhead, only while the tape moves.
             // Crossfade from the old layer to the new: old + g x (Sat(keep x old + input) - old).
             // Keep running after g reaches 0 until the head's delayed writes are done.
             if (g > 0.0f || (head_ran && head.Pending())) {
+                PROF_BEGIN(t_head);
                 if (!head_ran) head.Start();   // re-sync to the playhead after a pause
                 head.Process(player.Pos(), player.Step(), player.Bounces(),
                              player.RegionStart(), player.RegionLen(), player.RegionXfade(), player.RegionOvdXfade(), player.RegionLead(),
-                             in_l, in_r, g, kOverdubKeep);
+                             in_l, in_r, g, kp);
+                PROF_END(kProfHead, t_head);
                 head_now = true;
             }
         }
@@ -153,13 +201,136 @@ void AudioCallback(AudioHandle::InputBuffer in,
         // Tape format character on the grains (enveloped) and on the monitored input; its hiss
         // sounds while the tape plays or the input goes to tape.
         const float hiss = (e > mon_gain) ? e : mon_gain;
+        PROF_BEGIN(t_tape);
         const float fl = fmt_l.Process(l * e + mon_gain * in_l, hiss);
         const float fr = fmt_r.Process(r * e + mon_gain * in_r, hiss);
+        PROF_END(kProfTape, t_tape);
         vol_s += 0.002f * (vol - vol_s);   // smoothed output volume (P01 + S35)
-        out[0][i] = vol_s * (fl + (1.0f - mon_gain) * in_l);   // + dry input monitor when not going to tape
-        out[1][i] = vol_s * (fr + (1.0f - mon_gain) * in_r);
+        mix_s += 0.002f * (mixv - mix_s);
+        mixmode_s = (mixmode > mixmode_s) ? fminf(mixmode_s + kRecFade, 1.0f) : fmaxf(mixmode_s - kRecFade, mixmode);
+        // Normal: device + dry input monitor when not going to tape. Mix mode (right switch down):
+        // equal-power mix of the device output and the dry input. 10 ms crossfade between the two.
+        const float dev = FastSinHalfPi(1.0f - mix_s), dry = FastSinHalfPi(mix_s);
+        const float nl = fl + (1.0f - mon_gain) * in_l, nr = fr + (1.0f - mon_gain) * in_r;
+        const float ml = dev * fl + dry * in_l, mr = dev * fr + dry * in_r;
+        out[0][i] = vol_s * (nl + mixmode_s * (ml - nl));
+        out[1][i] = vol_s * (nr + mixmode_s * (mr - nr));
+    }
+#ifdef CPU_TEST
+    prof_now[kProfBlock] = DWT->CYCCNT - prof_block;
+    if (prof_reset) {
+        for (int p = 0; p < kProfCount; p++) prof_sum[p] = prof_max[p] = 0;
+        prof_blocks = 0;
+        prof_reset = false;
+    }
+    prof_blocks++;
+    for (int p = 0; p < kProfCount; p++) {
+        prof_sum[p] += prof_now[p];
+        if (prof_now[p] > prof_max[p]) prof_max[p] = prof_now[p];
+    }
+    cpu.OnBlockEnd();
+#endif
+}
+
+#ifdef CPU_TEST
+// CPU stress test, build with: C_DEFS=-DCPU_TEST make -C template. Never part of the normal
+// firmware. Fills the tape with a loud test signal (a 10 s recording plus overdub layers), then
+// cycles through worst-case scenarios with no controls touched and prints the audio callback
+// load (average and peak) over USB serial.
+struct CpuScenario {
+    const char* name;
+    int   mode;
+    float battery, aging, type, fade, a, b;
+    bool  play, overdub, moves;
+};
+static constexpr int kFwd = GrainPlayer::FORWARD, kBwd = GrainPlayer::BACKWARD, kPing = GrainPlayer::PINGPONG;
+static const CpuScenario kScenarios[] = {
+    // A short loop (0.5 s) with the longest crossfade keeps half of every pass in the crossfade.
+    {"stopped",                       kFwd, 0.5f, 0.0f, 0.33f,  200.0f, 0.0f, 1.0f,  false, false, false},
+    {"play",                          kFwd, 0.5f, 0.0f, 0.33f,  200.0f, 0.0f, 1.0f,  true,  false, false},
+    {"overdub, clean",                kFwd, 0.5f, 0.0f, 0.33f,  200.0f, 0.0f, 1.0f,  true,  true,  false},
+    {"overdub, aging max, fastest",   kFwd, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.07f, true,  true,  false},
+    {"  same, backward",              kBwd, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.07f, true,  true,  false},
+    {"  same, ping-pong",             kPing, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.07f, true,  true,  false},
+    {"  same, slowest",               kFwd, 0.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.07f, true,  true,  false},
+    {"  same, fastest, loop moving",  kFwd, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.07f, true,  true,  true},
+};
+
+static void PrintLoad(const char* label) {
+    const int avg = (int)(cpu.GetAvgCpuLoad() * 1000.0f + 0.5f);   // tenths of a percent
+    const int max = (int)(cpu.GetMaxCpuLoad() * 1000.0f + 0.5f);
+    hw.PrintLine("%-30s avg %3d.%d %%   peak %3d.%d %%", label, avg / 10, avg % 10, max / 10, max % 10);
+    // Per part, in tenths of a percent of the block's time budget: average / peak block.
+    const float budget = (float)SystemCoreClock * (float)hw.AudioBlockSize() / hw.AudioSampleRate();
+    const uint32_t blocks = prof_blocks ? prof_blocks : 1;
+    int a[kProfCount], m[kProfCount];
+    for (int p = 0; p < kProfCount; p++) {
+        a[p] = (int)(1000.0f * (float)prof_sum[p] / (float)blocks / budget + 0.5f);
+        m[p] = (int)(1000.0f * (float)prof_max[p] / budget + 0.5f);
+    }
+    hw.PrintLine("    grains %d.%d/%d.%d  head %d.%d/%d.%d  tape %d.%d/%d.%d  block %d.%d/%d.%d  (avg/peak %%)",
+                 a[0] / 10, a[0] % 10, m[0] / 10, m[0] % 10, a[1] / 10, a[1] % 10, m[1] / 10, m[1] % 10,
+                 a[2] / 10, a[2] % 10, m[2] / 10, m[2] % 10, a[3] / 10, a[3] % 10, m[3] / 10, m[3] % 10);
+}
+
+static void CpuTestFill() {
+    // Loud material (above the soft-limit knee) on both tracks and in the lead-ins.
+    uint32_t seed = 1;
+    const size_t len = 48000 * 10;
+    for (size_t i = 0; i < len; i++) {
+        seed = seed * 1664525u + 1013904223u;
+        const float noise = (float)(int32_t)seed * (1.0f / 2147483648.0f);
+        const float s = 0.6f * sinf(0.0287f * (float)i) + 0.3f * noise;
+        buf_l[i] = buf_r[i] = s;
+        ovd_l[i] = ovd_r[i] = 0.5f * sinf(0.0491f * (float)i) + 0.2f * noise;
+    }
+    for (size_t i = 0; i < kPreRoll; i++) pre_l[0][i] = pre_r[0][i] = 0.5f * sinf(0.0287f * (float)i);
+    for (size_t i = 0; i < kOvdPre; i++) ovd_pre_l[i] = ovd_pre_r[i] = 0.3f * sinf(0.0491f * (float)i);
+    player.SetPreRoll(pre_l[0], pre_r[0], kPreRoll, 0);
+    head.SetPreRoll(pre_l[0], pre_r[0], kPreRoll, 0);
+    pre_live = 1;
+    length = len;
+    player.SetLength(len);
+    player.Reset();
+}
+
+static void CpuTestRun() {
+    hw.StartLog(false);
+    cpu.Init(hw.AudioSampleRate(), hw.AudioBlockSize());
+    // Cycle counter for the per-part breakdown.
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->LAR = 0xC5ACCE55;   // unlock (Cortex-M7)
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    for (int cycle = 1;; cycle++) {
+        System::Delay(2000);
+        hw.PrintLine("CPU test, cycle %d (16-sample blocks at 48 kHz)", cycle);
+        for (const CpuScenario& s : kScenarios) {
+            mode = s.mode;
+            battery = s.battery;
+            SetAgingFrom(s.aging, s.type);
+            tape_type = s.type;
+            fade_ms = s.fade;
+            range_a = s.a;
+            range_b = s.b;
+            want_play = s.play;
+            want_overdub = s.overdub;
+            const uint32_t t0 = System::GetNow();
+            bool reset = false;
+            while (System::GetNow() - t0 < 5000) {
+                if (!reset && System::GetNow() - t0 >= 1000) {   // 1 s to settle
+                    cpu.Reset();
+                    prof_reset = true;
+                    reset = true;
+                }
+                if (s.moves) range_a = ((System::GetNow() / 400) % 2) ? 0.32f : 0.3f;
+                System::Delay(5);
+            }
+            PrintLoad(s.name);
+        }
     }
 }
+#endif
 
 int main(void) {
     hw.Init(true);
@@ -192,6 +363,11 @@ int main(void) {
     fmt_r.Init(sr, 0x2545F491);   // different seed: independent hiss per channel
     motor.Init(hw.AudioCallbackRate());
     touch.Init(hw);
+#ifdef CPU_TEST
+    CpuTestFill();
+    hw.StartAudio(AudioCallback);
+    CpuTestRun();   // never returns
+#endif
     hw.StartAudio(AudioCallback);
 
     // Settle baseline capacitance at boot
@@ -213,7 +389,7 @@ int main(void) {
         }
     });
 
-    bool was_vol_mode = false;
+    bool was_vol_mode = false, was_mixing = false;
     while (1) {
         touch.Process();
         Knobs& k = touch.knobs();
@@ -228,28 +404,30 @@ int main(void) {
         const float c37 = settle[1].Process(ctl[7].Process(k.RightFader()), now);
         grain_ms = 10.0f * powf(50.0f, c30);          // S30: 10..500 ms, exponential
         battery  = c31;                               // S31: battery 0 dead, 0.5 fresh, 1 over-voltage
-        // S32: overdub aging per pass, scaled by tape type (S34). At S32 = 1 the old layers get a
-        // per-pass low-pass of 8 kHz (reel-to-reel) .. 1.5 kHz (dictaphone); S32 = 0: no aging.
-        const float f_min = 8000.0f * powf(1500.0f / 8000.0f, c34);
-        const float a_min = 1.0f - expf(-6.2831853f * f_min / 48000.0f);
-        age_coef = 1.0f - c32 * (1.0f - a_min);
-        age_hiss = c32 * (0.0003f + 0.0012f * c34);   // per-pass hiss, before the low-pass
-        // Printed stutter bursts per written sample: S32 x 0.15/s (reel-to-reel) .. S32 x 1.5/s
-        // (dictaphone); each jerk peaks at up to S32 x 0.5 % .. S32 x 3 % pitch.
-        age_wob = c32 * 0.15f * powf(10.0f, c34) / 48000.0f;
-        age_wob_pitch = c32 * (0.005f + 0.025f * c34);
+        SetAgingFrom(c32, c34);                       // S32: overdub aging per pass, scaled by tape type (S34)
         fade_ms  = 10.0f + 1990.0f * c33;             // S33: loop crossfade, 10 ms..2 s
         tape_type = c34;                              // S34: tape type 0 reel-to-reel .. 1 dictaphone
-        // S35 is shared: resonance normally, output volume while P01 is held (pick-up on both).
+        // Right switch: overdub mode. Up = aging + -1 dB per pass, center = aging only, down = aging
+        // only + P01 + S35 is the device / input mix.
+        const int osw = touch.switches().B();
+        keep = (osw == Switch3::POS_UP) ? kOverdubKeep : 1.0f;
+        const bool mixing = (osw == Switch3::POS_DOWN);
+        mix_mode = mixing;
+        // S35 is shared: resonance normally; while P01 is held, output volume (or the mix with the
+        // right switch down). Pick-up on all jobs.
         const bool vol_mode = touch.pads().IsTouched(1);
-        if (vol_mode != was_vol_mode) {
+        if (vol_mode != was_vol_mode || mixing != was_mixing) {
             res_pick.Release();
             vol_pick.Release();
+            mix_pick.Release();
             was_vol_mode = vol_mode;
+            was_mixing = mixing;
         }
         const float c35r = vol_mode ? res_pick.Value() : res_pick.Process(c35);
-        const float c35v = vol_mode ? vol_pick.Process(c35) : vol_pick.Value();
+        const float c35v = (vol_mode && !mixing) ? vol_pick.Process(c35) : vol_pick.Value();
+        const float c35m = (vol_mode && mixing) ? mix_pick.Process(c35) : mix_pick.Value();
         volume   = 2.0f * c35v * c35v;                // P01 + S35: mute .. unity (0.71) .. +6 dB
+        mix      = c35m;                              // P01 + S35, switch down: device (0) .. dry input (1)
         float q  = 0.5f + 10.0f * c35r;               // S35: filter Q 0.5..10.5
         float rr = 1.0f - 0.5f / q;                   // Svf resonance giving that Q
         res      = rr * rr * rr * rr;

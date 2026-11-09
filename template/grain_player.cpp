@@ -1,4 +1,5 @@
 #include "grain_player.h"
+#include "fast_math.h"
 
 #include <cmath>
 
@@ -67,10 +68,10 @@ void GrainPlayer::SetSpeed(float speed) {
     speed_ = (speed < 0.0f) ? 0.0f : speed;
 }
 
-void GrainPlayer::SetPitch(float semitones) {
-    if (semitones < -36.0f) semitones = -36.0f;
-    else if (semitones > 36.0f) semitones = 36.0f;
-    ratio_ = powf(2.0f, semitones / 12.0f);
+void GrainPlayer::SetRatio(float ratio) {
+    if (ratio < 0.125f) ratio = 0.125f;   // -36 semitones
+    else if (ratio > 8.0f) ratio = 8.0f;  // +36 semitones
+    ratio_ = ratio;
 }
 
 void GrainPlayer::SetGrainMs(float ms) {
@@ -135,8 +136,18 @@ void GrainPlayer::NextRegion(double& start, double& rlen) const {
 }
 
 double GrainPlayer::Wrap(double x, double len) {
-    x = fmod(x, len);
-    if (x < 0.0) x += len;
+    // Positions are almost always within one loop length of the loop: subtract instead of fmod
+    // (same result, the subtraction is exact).
+    if (x >= len) {
+        x -= len;
+        if (x >= len) x = fmod(x, len);
+    } else if (x < 0.0) {
+        x += len;
+        if (x < 0.0) {
+            x = fmod(x, len);
+            if (x < 0.0) x += len;
+        }
+    }
     if (x >= len) x = 0.0;
     return x;
 }
@@ -201,8 +212,8 @@ void GrainPlayer::LoopSample(long n, long xf, long xo, long k, float& out_l, flo
         out_l = buf_l_[i];
         out_r = buf_r_[i];
         if (xf >= 1 && k >= n - xf) {
-            const float u = 1.5707963f * (float)(k - (n - xf)) / (float)xf;
-            const float c = cosf(u), s = sinf(u);
+            const float u = (float)(k - (n - xf)) / (float)xf;
+            const float c = FastSinHalfPi(1.0f - u), s = FastSinHalfPi(u);
             float ll, lr;
             Lead((long)lead_start_ - (n - k), ll, lr);
             out_l = c * out_l + s * ll;
@@ -218,8 +229,8 @@ void GrainPlayer::LoopSample(long n, long xf, long xo, long k, float& out_l, flo
         ol = ovd_l_[i];
         orr = ovd_r_[i];
         if (xo >= 1 && k >= n - xo) {
-            const float u = 1.5707963f * (float)(k - (n - xo)) / (float)xo;
-            const float c = cosf(u), s = sinf(u);
+            const float u = (float)(k - (n - xo)) / (float)xo;
+            const float c = FastSinHalfPi(1.0f - u), s = FastSinHalfPi(u);
             float ll, lr;
             OvdLead((long)lead_start_ - (n - k), ll, lr);
             ol = c * ol + s * ll;
@@ -228,6 +239,18 @@ void GrainPlayer::LoopSample(long n, long xf, long xo, long k, float& out_l, flo
     }
     out_l += ol;
     out_r += orr;
+}
+
+// Both tracks at loop position rel (0 .. n), interpolated between loop samples.
+void GrainPlayer::ReadAt(double rel, long n, long xf, long xo, float& out_l, float& out_r) const {
+    long k0 = (long)rel;
+    if (k0 >= n) k0 = n - 1;
+    const float frac = (float)(rel - (double)k0);
+    float l0, r0, l1, r1;
+    LoopSample(n, xf, xo, k0, l0, r0);
+    LoopSample(n, xf, xo, k0 + 1, l1, r1);   // k0 + 1 = n: what follows the end (the lead)
+    out_l = l0 + frac * (l1 - l0);
+    out_r = r0 + frac * (r1 - r0);
 }
 
 void GrainPlayer::Process(float& out_l, float& out_r) {
@@ -338,25 +361,24 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
         off_[1] = 0.0;
     }
 
-    const float ph[2] = {phase_, (phase_ >= 0.5f) ? (phase_ - 0.5f) : (phase_ + 0.5f)};
-
-    float l = 0.0f;
-    float r = 0.0f;
-
+    float l, r;
     const long n = (long)region_len_;
     const long xf = Xfade(n);
     const long xo = OvdXfade(n);
-    for (int g = 0; g < 2; g++) {
-        const double rel = Wrap(start_[g] + off_[g], region_len_);
-        long k0 = (long)rel;
-        if (k0 >= n) k0 = n - 1;
-        const float frac = (float)(rel - (double)k0);
+    const double rel0 = Wrap(start_[0] + off_[0], region_len_);
+    const double rel1 = Wrap(start_[1] + off_[1], region_len_);
+    if (fabs(rel0 - rel1) < 1e-6) {
+        // Both grains read the same point (the usual case: they ride the playhead) and their
+        // Hann windows add up to exactly 1, so one read is the whole output.
+        ReadAt(rel0, n, xf, xo, l, r);
+    } else {
+        // Grain 1's window is 1 - grain 0's (50 % overlap).
         float l0, r0, l1, r1;
-        LoopSample(n, xf, xo, k0, l0, r0);
-        LoopSample(n, xf, xo, k0 + 1, l1, r1);   // k0 + 1 = n: what follows the end (the lead)
-        const float w = 0.5f - 0.5f * cosf(kTwoPi * ph[g]);
-        l += w * (l0 + frac * (l1 - l0));
-        r += w * (r0 + frac * (r1 - r0));
+        ReadAt(rel0, n, xf, xo, l0, r0);
+        ReadAt(rel1, n, xf, xo, l1, r1);
+        const float w0 = 0.5f - 0.5f * cosf(kTwoPi * phase_);
+        l = l1 + w0 * (l0 - l1);
+        r = r1 + w0 * (r0 - r1);
     }
 
     // Advance grain read offsets (integrated, so ratio changes don't make grains jump).

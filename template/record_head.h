@@ -52,6 +52,9 @@ private:
     void Write(long k, bool bounce, size_t region_start, long region_len, long xf, long xo, long lead,
                float x_l, float x_r, float gain, float keep);
     bool Slot(Track& t, long m, float*& pl, float*& pr);   // sample m of a track (its lead-in when m < 0)
+    // Buffer samples passed by a head moving from `from` by s (sample k is passed when the head
+    // crosses k + 0.5): first, how many, and the direction (+1 / -1).
+    static void Crossings(double from, float s, long& first, long& count, long& dir);
     float Noise();                              // white noise -1 .. 1
     double Wobble(long k, long region_len, long xf);   // printed-stutter read offset for loop sample k
     static constexpr int kLag = 8;              // samples behind the playhead
@@ -80,9 +83,9 @@ private:
     bool   synced_ = false;
     double from_ = 0.0;                         // head position after the last step
     long   start_ = 0, len_ = 0;                // loop the head was in at from_
-    long   xf_ = 0;                             // crossfade length of that loop
-    long   xo_ = 0;                             // overdub seam length of that loop
-    long   lead_ = 0;                           // crossfade lead of that loop
+    double ghost_from_ = 0.0;                   // after a jump: the old track's head position, absolute buffer samples
+    long   ghost_left_ = 0;                     // samples the ghost still writes (fading out), 0 = none
+    long   fade_left_ = 0;                      // samples until the write at the new place is fully in
     float  prev_l_ = 0.0f, prev_r_ = 0.0f;      // input at the last step
     float  lp_l_ = 0.0f, lp_r_ = 0.0f;          // input low-pass (follows the tape speed)
     bool   lp_init_ = false;

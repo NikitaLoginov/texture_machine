@@ -1,5 +1,6 @@
 #include "grain_player.h"
 #include "fast_math.h"
+#include "debug_trace.h"
 
 #include <cmath>
 
@@ -21,6 +22,7 @@ void GrainPlayer::Init(const float* buf_l, const float* buf_r, size_t capacity, 
     length_ = 0;
     range_a_ = 0.0f;
     range_b_ = 1.0f;
+    writing_ = false;
     mode_ = FORWARD;
     speed_ = 1.0f;
     ratio_ = 1.0f;
@@ -30,14 +32,15 @@ void GrainPlayer::Init(const float* buf_l, const float* buf_r, size_t capacity, 
     dir_ = 1.0f;
     step_ = 0.0f;
     phase_ = 0.0f;
-    start_[0] = 0.0;
-    start_[1] = 0.0;
-    gdir_[0] = 1.0f;
-    gdir_[1] = 1.0f;
-    off_[0] = off_[1] = 0.0;
-    next_start_ = next_len_ = 0.0;
 
     UpdateRegion();
+    for (int g = 0; g < 2; g++) {
+        start_[g] = 0.0;
+        gdir_[g] = 1.0f;
+        off_[g] = 0.0;
+        gbase_[g] = region_start_;
+        glen_[g] = region_len_;
+    }
 }
 
 void GrainPlayer::SetLength(size_t length) {
@@ -54,10 +57,6 @@ void GrainPlayer::SetRange(float a, float b) {
 }
 
 void GrainPlayer::SetMode(Mode mode) {
-    if (mode != mode_) {   // a loop change waiting for the wrap starts over in the new mode
-        latched_ = false;
-        lead_start_ = region_start_;
-    }
     mode_ = mode;
     if (mode == FORWARD) dir_ = 1.0f;
     else if (mode == BACKWARD) dir_ = -1.0f;
@@ -107,32 +106,75 @@ void GrainPlayer::Reset() {
     pos_ = (mode_ == BACKWARD) ? (region_len_ - 1.0) : 0.0;
     if (pos_ < 0.0) pos_ = 0.0;
     phase_ = 0.0f;
-    start_[0] = pos_;
-    start_[1] = pos_;
-    gdir_[0] = dir_;
-    gdir_[1] = dir_;
-    off_[0] = off_[1] = 0.0;
+    for (int g = 0; g < 2; g++) {
+        start_[g] = pos_;
+        gdir_[g] = dir_;
+        off_[g] = 0.0;
+        gbase_[g] = region_start_;
+        glen_[g] = region_len_;
+    }
 }
 
-// Applies the loop set by SetRange now (new recording, play start).
+// Applies the loop set by SetRange now (new recording, play start). Playing grains keep their loop.
 void GrainPlayer::UpdateRegion() {
     NextRegion(region_start_, region_len_);
-    lead_start_ = region_start_;
-    latched_ = false;
     if (region_len_ >= 1.0) pos_ = Wrap(pos_, region_len_);
     else pos_ = 0.0;
 }
 
 // The loop set by SetRange. Left fader (range_a_) sets the start, right fader (range_b_) the loop
-// length as a share of the recording after the start, so the end always follows the start.
+// length out of the recording after the start, so the end always follows the start. The length
+// is exponential: 100 ms (one grain, shorter loops buzz) at 0 .. all of the rest at 1, the same
+// fader travel for each doubling.
 void GrainPlayer::NextRegion(double& start, double& rlen) const {
-    const double kMinRegion = 480.0;   // 10 ms at 48 kHz
+    const double kMinRegion = 0.1 * (double)sr_;   // 100 ms
     const double len = (double)length_;
     start = floor(range_a_ * len);   // whole samples
-    rlen = floor(range_b_ * (len - start));
+    const double rest = len - start;
+    rlen = (rest > kMinRegion) ? floor(kMinRegion * (double)powf((float)(rest / kMinRegion), range_b_)) : kMinRegion;
     if (rlen < kMinRegion) rlen = kMinRegion;
     if (start + rlen > len) start = len - rlen;
     if (start < 0.0) { start = 0.0; rlen = len; }
+}
+
+// While the record head writes, the loop holds still with the playhead in the end crossfade zone
+// (where the head writes the seam and the lead before the start) or at the very start (its tails
+// past the end), each plus kEdgeHold. A loop too short to leave room for a grain start between
+// these zones is never held (the faders would stop working).
+bool GrainPlayer::Frozen() const {
+    if (!writing_) return false;
+    const double n = region_len_;
+    long xz = Xfade((long)n);
+    const long xo = OvdXfade((long)n);
+    if (xo > xz) xz = xo;
+    const double room = n - (double)xz - 2.0 * kEdgeHold;
+    if (room < (double)speed_ * (double)grain_len_) return false;   // two grain starts' travel
+    return pos_ >= n - (double)xz - kEdgeHold || pos_ < kEdgeHold;
+}
+
+// Fader changes take effect at a grain start (every half grain): the playhead keeps its place in
+// the loop and the new grain reads the new loop, while the other grain finishes in the old one.
+void GrainPlayer::Apply() {
+    if (Frozen()) return;
+    double ns, nl;
+    NextRegion(ns, nl);
+    if (ns == region_start_ && nl == region_len_) return;
+    region_start_ = ns;
+    region_len_ = nl;
+    pos_ = Wrap(pos_, region_len_);
+}
+
+void GrainPlayer::StartGrain(int g) {
+    TRACE_STAGE(kTrGrainStart);
+    Apply();
+    TRACE_SET(rs, (int32_t)region_start_);
+    TRACE_SET(rl, (int32_t)region_len_);
+    TRACE_SET(pos, (float)pos_);
+    start_[g] = pos_;
+    gdir_[g] = dir_;
+    off_[g] = 0.0;
+    gbase_[g] = region_start_;
+    glen_[g] = region_len_;
 }
 
 double GrainPlayer::Wrap(double x, double len) {
@@ -196,18 +238,17 @@ void GrainPlayer::OvdLead(long m, float& out_l, float& out_r) const {
     }
 }
 
-// Loop sample k (0 .. n) of the current loop of n samples: recording + overdub track.
+// Loop sample k (0 .. n) of the loop of n samples starting at base: recording + overdub track.
 // Recording: over the last xf samples (S33) an equal-power crossfade from the loop end into the
-// audio before lead_start_. Overdub track: the same over its own short seam xo, into the overdub
-// track before lead_start_. k = n is the sample that follows the end: the leads at distance 0.
-// Normally lead_start_ is the loop start; during a loop change it is the other loop's start.
-void GrainPlayer::LoopSample(long n, long xf, long xo, long k, float& out_l, float& out_r) const {
-    long i = (long)region_start_ + ((k >= n) ? 0 : k);
+// audio before base. Overdub track: the same over its own short seam xo, into the overdub track
+// before base. k = n is the sample that follows the end: the leads at distance 0.
+void GrainPlayer::LoopSample(long base, long n, long xf, long xo, long k, float& out_l, float& out_r) const {
+    long i = base + ((k >= n) ? 0 : k);
     if (i >= (long)length_) i = (long)length_ - 1;
     if (i < 0) i = 0;
     // Recording.
     if (k >= n && xf >= 1) {
-        Lead((long)lead_start_, out_l, out_r);
+        Lead(base, out_l, out_r);
     } else {
         out_l = buf_l_[i];
         out_r = buf_r_[i];
@@ -215,7 +256,7 @@ void GrainPlayer::LoopSample(long n, long xf, long xo, long k, float& out_l, flo
             const float u = (float)(k - (n - xf)) / (float)xf;
             const float c = FastSinHalfPi(1.0f - u), s = FastSinHalfPi(u);
             float ll, lr;
-            Lead((long)lead_start_ - (n - k), ll, lr);
+            Lead(base - (n - k), ll, lr);
             out_l = c * out_l + s * ll;
             out_r = c * out_r + s * lr;
         }
@@ -224,7 +265,7 @@ void GrainPlayer::LoopSample(long n, long xf, long xo, long k, float& out_l, flo
     if (ovd_l_ == nullptr) return;
     float ol, orr;
     if (k >= n && xo >= 1) {
-        OvdLead((long)lead_start_, ol, orr);
+        OvdLead(base, ol, orr);
     } else {
         ol = ovd_l_[i];
         orr = ovd_r_[i];
@@ -232,7 +273,7 @@ void GrainPlayer::LoopSample(long n, long xf, long xo, long k, float& out_l, flo
             const float u = (float)(k - (n - xo)) / (float)xo;
             const float c = FastSinHalfPi(1.0f - u), s = FastSinHalfPi(u);
             float ll, lr;
-            OvdLead((long)lead_start_ - (n - k), ll, lr);
+            OvdLead(base - (n - k), ll, lr);
             ol = c * ol + s * ll;
             orr = c * orr + s * lr;
         }
@@ -241,14 +282,17 @@ void GrainPlayer::LoopSample(long n, long xf, long xo, long k, float& out_l, flo
     out_r += orr;
 }
 
-// Both tracks at loop position rel (0 .. n), interpolated between loop samples.
-void GrainPlayer::ReadAt(double rel, long n, long xf, long xo, float& out_l, float& out_r) const {
+// Both tracks at position rel (0 .. n) of the loop of n samples starting at base, interpolated
+// between loop samples.
+void GrainPlayer::ReadAt(double rel, long base, long n, float& out_l, float& out_r) const {
+    const long xf = Xfade(n);
+    const long xo = OvdXfade(n);
     long k0 = (long)rel;
     if (k0 >= n) k0 = n - 1;
     const float frac = (float)(rel - (double)k0);
     float l0, r0, l1, r1;
-    LoopSample(n, xf, xo, k0, l0, r0);
-    LoopSample(n, xf, xo, k0 + 1, l1, r1);   // k0 + 1 = n: what follows the end (the lead)
+    LoopSample(base, n, xf, xo, k0, l0, r0);
+    LoopSample(base, n, xf, xo, k0 + 1, l1, r1);   // k0 + 1 = n: what follows the end (the lead)
     out_l = l0 + frac * (l1 - l0);
     out_r = r0 + frac * (r1 - r0);
 }
@@ -256,6 +300,7 @@ void GrainPlayer::ReadAt(double rel, long n, long xf, long xo, float& out_l, flo
 void GrainPlayer::Process(float& out_l, float& out_r) {
     static constexpr float kTwoPi = 6.28318530718f;
 
+    TRACE_STAGE(kTrPlayer);
     if (length_ < 2 || region_len_ < 2.0) {
         step_ = 0.0f;
         out_l = 0.0f;
@@ -263,119 +308,49 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
         return;
     }
 
-    // Advance playhead.
+    // Advance playhead: wrap at the loop edges, or bounce in ping-pong.
     if (mode_ == FORWARD) dir_ = 1.0f;
     else if (mode_ == BACKWARD) dir_ = -1.0f;
     step_ = dir_ * speed_;
     pos_ += step_;
-
-    // A loop change (SetRange) goes through the loop crossfade, like a normal wrap, and all grains
-    // move with the playhead into the new loop:
-    // Forward: fixed kLeadMargin before the playhead enters the crossfade, whose lead then comes from before the
-    //   NEW start; applied at the wrap.
-    // Backward, Ping-Pong (end bounce only): applied at the wrap / bounce; the new loop's first
-    //   crossfade keeps the lead from before the OLD start, until the playhead leaves it.
-    double ns, nl;
-    if (mode_ == FORWARD) {
-        if (!latched_ && pos_ >= region_len_ - (double)Xfade((long)region_len_) - kLeadMargin) {
-            NextRegion(ns, nl);
-            if (ns != region_start_ || nl != region_len_) {
-                latched_ = true;
-                next_start_ = ns;
-                next_len_ = nl;
-                lead_start_ = ns;
-            }
-        }
-        if (pos_ >= region_len_) {
-            const double over = pos_ - region_len_;
-            if (latched_) {
-                for (int g = 0; g < 2; g++) {
-                    start_[g] += off_[g] - region_len_;
-                    off_[g] = 0.0;
-                }
-                region_start_ = next_start_;
-                region_len_ = next_len_;
-                lead_start_ = region_start_;
-                latched_ = false;
-            }
-            pos_ = Wrap(over, region_len_);
-        }
-    } else if (mode_ == BACKWARD) {
-        if (pos_ < 0.0) {
-            NextRegion(ns, nl);
-            if (ns != region_start_ || nl != region_len_) {
-                for (int g = 0; g < 2; g++) {
-                    start_[g] += off_[g] + nl;
-                    off_[g] = 0.0;
-                }
-                lead_start_ = region_start_;
-                region_start_ = ns;
-                region_len_ = nl;
-            }
-            pos_ = Wrap(pos_, region_len_);
-        }
-        if (lead_start_ != region_start_ && pos_ < region_len_ - (double)Xfade((long)region_len_) - kLeadMargin)
-            lead_start_ = region_start_;
-    } else {
-        if (pos_ >= region_len_) {
-            const double over = pos_ - region_len_;
-            NextRegion(ns, nl);
-            if (ns != region_start_ || nl != region_len_) {
-                // Grains turn with the playhead (mirrored at the old end) and keep their distance
-                // to the end.
-                for (int g = 0; g < 2; g++) {
-                    double u = start_[g] + off_[g];
-                    if (gdir_[g] > 0.0f) u = 2.0 * region_len_ - u;
-                    start_[g] = u + (nl - region_len_);
-                    off_[g] = 0.0;
-                    gdir_[g] = -1.0f;
-                }
-                lead_start_ = region_start_;
-                region_start_ = ns;
-                region_len_ = nl;
-            }
-            pos_ = region_len_ - over;
-            dir_ = -1.0f;
-        }
+    if (mode_ == PINGPONG) {
+        if (pos_ >= region_len_) { pos_ = 2.0 * region_len_ - pos_; dir_ = -1.0f; }
         if (pos_ < 0.0) { pos_ = -pos_; dir_ = 1.0f; }
         // Bounce stays inside the loop (a position exactly on the end must not wrap to 0).
         if (pos_ >= region_len_) pos_ = region_len_ - 0.000001;
         if (pos_ < 0.0) pos_ = 0.0;
-        if (lead_start_ != region_start_ && dir_ < 0.0f &&
-            pos_ < region_len_ - (double)Xfade((long)region_len_) - kLeadMargin)
-            lead_start_ = region_start_;
+    } else {
+        pos_ = Wrap(pos_, region_len_);
     }
+    TRACE_SET(mode, (int32_t)mode_);
+    TRACE_SET(rs, (int32_t)region_start_);
+    TRACE_SET(rl, (int32_t)region_len_);
+    TRACE_SET(pos, (float)pos_);
+    TRACE_SET(step, step_);
 
-    // Advance grain phase; restart grain 0 at 1.0 and grain 1 at 0.5 (50% overlap).
+    // Advance grain phase; restart grain 0 at 1.0 and grain 1 at 0.5 (50% overlap). A loop change
+    // (SetRange) is taken at a grain start.
     const float prev = phase_;
     phase_ += phase_inc_;
     if (phase_ >= 1.0f) {
         phase_ -= 1.0f;
-        start_[0] = pos_;
-        gdir_[0] = dir_;
-        off_[0] = 0.0;
+        StartGrain(0);
     }
-    if (prev < 0.5f && phase_ >= 0.5f) {
-        start_[1] = pos_;
-        gdir_[1] = dir_;
-        off_[1] = 0.0;
-    }
+    if (prev < 0.5f && phase_ >= 0.5f) StartGrain(1);
 
+    TRACE_STAGE(kTrRead);
     float l, r;
-    const long n = (long)region_len_;
-    const long xf = Xfade(n);
-    const long xo = OvdXfade(n);
-    const double rel0 = Wrap(start_[0] + off_[0], region_len_);
-    const double rel1 = Wrap(start_[1] + off_[1], region_len_);
-    if (fabs(rel0 - rel1) < 1e-6) {
-        // Both grains read the same point (the usual case: they ride the playhead) and their
-        // Hann windows add up to exactly 1, so one read is the whole output.
-        ReadAt(rel0, n, xf, xo, l, r);
+    const double rel0 = Wrap(start_[0] + off_[0], glen_[0]);
+    const double rel1 = Wrap(start_[1] + off_[1], glen_[1]);
+    if (gbase_[0] == gbase_[1] && glen_[0] == glen_[1] && fabs(rel0 - rel1) < 1e-6) {
+        // Both grains read the same point of the same loop (the usual case: they ride the
+        // playhead) and their Hann windows add up to exactly 1, so one read is the whole output.
+        ReadAt(rel0, (long)gbase_[0], (long)glen_[0], l, r);
     } else {
         // Grain 1's window is 1 - grain 0's (50 % overlap).
         float l0, r0, l1, r1;
-        ReadAt(rel0, n, xf, xo, l0, r0);
-        ReadAt(rel1, n, xf, xo, l1, r1);
+        ReadAt(rel0, (long)gbase_[0], (long)glen_[0], l0, r0);
+        ReadAt(rel1, (long)gbase_[1], (long)glen_[1], l1, r1);
         const float w0 = 0.5f - 0.5f * cosf(kTwoPi * phase_);
         l = l1 + w0 * (l0 - l1);
         r = r1 + w0 * (r0 - r1);

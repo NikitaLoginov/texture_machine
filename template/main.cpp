@@ -8,6 +8,7 @@
 #include "record_head.h"
 #include "fast_math.h"
 #include "tilt_eq.h"
+#include "debug_trace.h"
 #include <cmath>
 
 using namespace daisy;
@@ -23,7 +24,6 @@ static TiltEq     tilt_l, tilt_r; // S30: tone tilt on the device output
 static Motor      motor;          // one tape transport for both channels
 static RecordHead head;           // overdub record head, follows the playhead
 static ControlFilter ctl[8];   // S30..S35, left fader (S36), right fader (S37)
-static SettleFilter  settle[2];  // loop faders: left, right; apply once still
 static Pickup drive_pick(0.5f, true);     // S35 normal job: drive
 static Pickup vol_pick(0.7071f, false);   // S35 while P01 is held: output volume (starts at unity)
 static Pickup mix_pick(0.5f, false);      // S35 while P01 is held, right switch down: device / input mix
@@ -90,6 +90,109 @@ static uint32_t prof_max[kProfCount], prof_blocks;
 #define PROF_END(part, t)
 #endif
 
+#ifdef DEBUG_TRACE
+// Diagnostic build, with (in template/): C_DEFS=-DDEBUG_TRACE make -s BUILD_DIR=build/debug
+// TARGET=template_debug. Never part of the normal firmware. Breadcrumbs (debug_trace.h) in backup
+// SRAM; a fault saves its registers and resets, a hang of more than 1 s resets through the
+// watchdog. After the reset the device runs normally and prints the report over USB serial.
+volatile DebugTrace __attribute__((section(".backup_sram"))) g_trace;
+static constexpr uint32_t kTraceArmed = 0x7A9E5EEDu;
+static DebugTrace trace_report;     // breadcrumbs from before the reset
+static bool have_report = false, report_hang = false;
+static constexpr int kVectors = 16 + 150;   // Cortex-M7 exceptions + STM32H750 interrupts
+alignas(1024) static uint32_t ram_vectors[kVectors];
+
+// Called with the stacked registers of the faulting code: r0-r3, r12, lr, pc, psr.
+extern "C" __attribute__((used)) void TraceFault(uint32_t* frame) {
+    g_trace.lr = frame[5];
+    g_trace.pc = frame[6];
+    g_trace.psr = frame[7];
+    g_trace.cfsr = SCB->CFSR;
+    g_trace.hfsr = SCB->HFSR;
+    g_trace.bfar = SCB->BFAR;
+    g_trace.mmfar = SCB->MMFAR;
+    g_trace.cause = 1;
+    __DSB();
+    NVIC_SystemReset();
+}
+
+extern "C" __attribute__((naked)) void TraceFaultEntry() {
+    __asm volatile(
+        "tst lr, #4    \n"
+        "ite eq        \n"
+        "mrseq r0, msp \n"
+        "mrsne r0, psp \n"
+        "b TraceFault  \n");
+}
+
+// After hw.Init: keep a report from before the reset, re-arm, route the faults to TraceFault.
+static void TraceBoot() {
+    System::InitBackupSram();
+    const uint32_t rsr = RCC->RSR;
+    RCC->RSR |= RCC_RSR_RMVF;
+    volatile uint32_t* src = reinterpret_cast<volatile uint32_t*>(&g_trace);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(&trace_report);
+    const int words = sizeof(DebugTrace) / 4;
+    if (g_trace.magic == kTraceArmed && (g_trace.cause == 1 || (rsr & RCC_RSR_IWDG1RSTF))) {
+        for (int i = 0; i < words; i++) dst[i] = src[i];
+        have_report = true;
+        report_hang = (g_trace.cause != 1);
+    }
+    for (int i = 0; i < words; i++) src[i] = 0;
+    g_trace.magic = kTraceArmed;
+    const uint32_t* v = reinterpret_cast<const uint32_t*>(SCB->VTOR);
+    for (int i = 0; i < kVectors; i++) ram_vectors[i] = v[i];
+    for (int i = 3; i <= 6; i++)   // HardFault, MemManage, BusFault, UsageFault
+        ram_vectors[i] = reinterpret_cast<uint32_t>(&TraceFaultEntry);
+    SCB_CleanDCache_by_Addr(ram_vectors, sizeof(ram_vectors));
+    __DSB();
+    SCB->VTOR = reinterpret_cast<uint32_t>(ram_vectors);
+    __DSB();
+    __ISB();
+    SCB->SHCSR |= SCB_SHCSR_MEMFAULTENA_Msk | SCB_SHCSR_BUSFAULTENA_Msk | SCB_SHCSR_USGFAULTENA_Msk;
+}
+
+// Independent watchdog: resets the device if the main loop stops refreshing it for 1 s.
+static void TraceWatchdogStart() {
+    IWDG1->KR = 0xCCCC;   // start
+    IWDG1->KR = 0x5555;   // unlock the settings
+    IWDG1->PR = 3;        // LSI 32 kHz / 32 = 1 kHz
+    IWDG1->RLR = 1000;    // 1 s
+    while (IWDG1->SR != 0) {}
+    IWDG1->KR = 0xAAAA;   // refresh
+}
+
+static const char* TraceStageName(uint32_t s) {
+    static const char* const names[] = {"none", "block start", "player", "grain start", "grain read",
+                                        "head", "head ghost", "head write", "head stutter",
+                                        "head lead zone", "tape sound", "block end"};
+    return (s <= kTrBlockEnd) ? names[s] : "?";
+}
+
+#define F3(x) ((x) < 0.0f ? '-' : ' '), (int)fabsf(x), (int)((fabsf(x) - floorf(fabsf(x))) * 1000.0f)
+static void TracePrint() {
+    if (!have_report) {
+        hw.PrintLine("diag build running, no report yet (blocks %lu)", (unsigned long)g_trace.blocks);
+        return;
+    }
+    const DebugTrace& t = trace_report;
+    hw.PrintLine("REPORT: %s in '%s', after %lu audio blocks, %lu main loops",
+                 report_hang ? "HANG (watchdog)" : "FAULT", TraceStageName(t.stage),
+                 (unsigned long)t.blocks, (unsigned long)t.main_loops);
+    if (!report_hang)
+        hw.PrintLine("  pc 0x%08lx lr 0x%08lx psr 0x%08lx cfsr 0x%08lx hfsr 0x%08lx bfar 0x%08lx mmfar 0x%08lx",
+                     (unsigned long)t.pc, (unsigned long)t.lr, (unsigned long)t.psr, (unsigned long)t.cfsr,
+                     (unsigned long)t.hfsr, (unsigned long)t.bfar, (unsigned long)t.mmfar);
+    hw.PrintLine("  player: mode %ld loop %ld + %ld pos %c%d.%03d step %c%d.%03d speed %c%d.%03d",
+                 (long)t.mode, (long)t.rs, (long)t.rl, F3(t.pos), F3(t.step), F3(t.speed));
+    hw.PrintLine("  head: loop %ld + %ld pos %c%d.%03d step %c%d.%03d from %c%d.%03d count %ld k %ld write %ld",
+                 (long)t.h_rs, (long)t.h_rl, F3(t.h_pos), F3(t.h_step), F3(t.from), (long)t.count,
+                 (long)t.k, (long)t.wi);
+    hw.PrintLine("  head jump: fade-in left %ld ghost left %ld ghost from %c%d.%03d",
+                 (long)t.fade_left, (long)t.ghost_left, F3(t.ghost_from));
+}
+#endif
+
 // S32: overdub aging per pass, scaled by tape type. At amount = 1 the old layers get a per-pass
 // low-pass of 8 kHz (reel-to-reel) .. 1.5 kHz (dictaphone); amount = 0: no aging.
 static void SetAgingFrom(float amount, float type) {
@@ -111,6 +214,8 @@ void AudioCallback(AudioHandle::InputBuffer in,
     const uint32_t prof_block = DWT->CYCCNT;
     uint32_t prof_now[kProfCount] = {};
 #endif
+    TRACE_STAGE(kTrBlock);
+    TRACE_SET(blocks, g_trace.blocks + 1);
     // 1. Copy flags into locals
     bool play = want_play;
     bool rec  = want_record;
@@ -150,6 +255,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
     const float mixmode = mix_mode ? 1.0f : 0.0f;
     const float tape_speed = motor.Process();
     const float deficit    = motor.Deficit();
+    TRACE_SET(speed, tape_speed);
     player.SetMode((GrainPlayer::Mode)mode);
     player.SetSpeed(tape_speed);
     // Varispeed: pitch follows tape speed (grains read at the tape speed, so they ride the playhead).
@@ -190,6 +296,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
         bool head_now = false;
         if ((play || env.IsRunning()) && !rec) {
             PROF_BEGIN(t_grains);
+            player.SetWriting(head_ran || g > 0.0f);   // loop changes wait while the head is at the loop edges
             player.Process(l, r);
             PROF_END(kProfGrains, t_grains);
             // Overdub: the record head follows the playhead, only while the tape moves.
@@ -209,6 +316,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
         // Tape format character on the grains (enveloped) and on the monitored input; its hiss
         // sounds while the tape plays or the input goes to tape.
         const float hiss = (e > mon_gain) ? e : mon_gain;
+        TRACE_STAGE(kTrTape);
         PROF_BEGIN(t_tape);
         const float fl = tilt_l.Process(fmt_l.Process(l * e + mon_gain * in_l, hiss));
         const float fr = tilt_r.Process(fmt_r.Process(r * e + mon_gain * in_r, hiss));
@@ -224,6 +332,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
         out[0][i] = vol_s * (nl + mixmode_s * (ml - nl));
         out[1][i] = vol_s * (nr + mixmode_s * (mr - nr));
     }
+    TRACE_STAGE(kTrBlockEnd);
 #ifdef CPU_TEST
     prof_now[kProfBlock] = DWT->CYCCNT - prof_block;
     if (prof_reset) {
@@ -257,11 +366,15 @@ static const CpuScenario kScenarios[] = {
     {"stopped",                       kFwd, 0.5f, 0.0f, 0.33f,  200.0f, 0.0f, 1.0f,  false, false, false},
     {"play",                          kFwd, 0.5f, 0.0f, 0.33f,  200.0f, 0.0f, 1.0f,  true,  false, false},
     {"overdub, clean",                kFwd, 0.5f, 0.0f, 0.33f,  200.0f, 0.0f, 1.0f,  true,  true,  false},
-    {"overdub, aging max, fastest",   kFwd, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.07f, true,  true,  false},
-    {"  same, backward",              kBwd, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.07f, true,  true,  false},
-    {"  same, ping-pong",             kPing, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.07f, true,  true,  false},
-    {"  same, slowest",               kFwd, 0.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.07f, true,  true,  false},
-    {"  same, fastest, loop moving",  kFwd, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.07f, true,  true,  true},
+    {"overdub, aging max, fastest",   kFwd, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.374f, true,  true,  false},
+    {"  same, backward",              kBwd, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.374f, true,  true,  false},
+    {"  same, ping-pong",             kPing, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.374f, true,  true,  false},
+    {"  same, slowest",               kFwd, 0.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.374f, true,  true,  false},
+    {"  same, fastest, loop moving",  kFwd, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.374f, true,  true,  true},
+    // The shortest loop (100 ms): the crossfade is half the loop and the loop is never held.
+    {"short 100 ms, aging max, fast", kFwd, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.0f,  true,  true,  false},
+    {"  same, loop moving",           kFwd, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.0f,  true,  true,  true},
+    {"  same, ping-pong, moving",     kPing, 1.0f, 1.0f, 1.0f, 2000.0f, 0.3f, 0.0f,  true,  true,  true},
 };
 
 static void PrintLoad(const char* label) {
@@ -342,6 +455,10 @@ static void CpuTestRun() {
 
 int main(void) {
     hw.Init(true);
+#ifdef DEBUG_TRACE
+    TraceBoot();
+    hw.StartLog(false);
+#endif
     hw.SetAudioBlockSize(16);
     hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
 
@@ -401,7 +518,19 @@ int main(void) {
     });
 
     bool was_vol_mode = false, was_mixing = false;
+#ifdef DEBUG_TRACE
+    TraceWatchdogStart();
+    uint32_t trace_t = System::GetNow();
+#endif
     while (1) {
+#ifdef DEBUG_TRACE
+        IWDG1->KR = 0xAAAA;   // watchdog refresh
+        g_trace.main_loops = g_trace.main_loops + 1;
+        if (System::GetNow() - trace_t >= 1000) {
+            trace_t = System::GetNow();
+            TracePrint();
+        }
+#endif
         touch.Process();
         Knobs& k = touch.knobs();
         const float c31 = ctl[1].Process(k.s31());
@@ -409,9 +538,9 @@ int main(void) {
         const float c33 = ctl[3].Process(k.s33());
         const float c34 = ctl[4].Process(k.s34());
         const float c35 = ctl[5].Process(k.s35());
-        const uint32_t now = System::GetNow();
-        const float c36 = settle[0].Process(ctl[6].Process(k.LeftFader()), now);
-        const float c37 = settle[1].Process(ctl[7].Process(k.RightFader()), now);
+        // Faders apply live: the player takes them at its next grain start.
+        const float c36 = ctl[6].Process(k.LeftFader());
+        const float c37 = ctl[7].Process(k.RightFader());
         // S30: tilt EQ on the device output, left darker .. middle flat .. right brighter.
         const float t30 = 2.0f * ctl[0].Process(k.s30()) - 1.0f;
         tilt     = (fabsf(t30) < 0.03f) ? 0.0f : t30;   // small dead zone: the middle is exactly flat
@@ -444,8 +573,8 @@ int main(void) {
         drive    = (c35d < 0.5f) ? 0.5f * powf(2.0f, 2.0f * c35d) : powf(4.0f, 2.0f * (c35d - 0.5f));
         // ...and right of the middle a head bump grows with it (0 .. +9 dB); middle = no bump, as before.
         bump     = (c35d > 0.5f) ? 2.0f * (c35d - 0.5f) : 0.0f;
-        range_a  = c36;                               // S36: loop start, applied once the fader stops
-        range_b  = c37;                               // S37: loop end, relative: share of the rest after the start; applied once the fader stops
+        range_a  = c36;                               // S36: loop start, live
+        range_b  = c37;                               // S37: loop length, 100 ms .. the rest after the start (exponential), live
         int sw = touch.switches().A();                    // left switch: play mode
         if (sw == Switch3::POS_UP)        mode = GrainPlayer::FORWARD;
         else if (sw == Switch3::POS_DOWN) mode = GrainPlayer::BACKWARD;

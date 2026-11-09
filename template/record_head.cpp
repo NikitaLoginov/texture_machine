@@ -1,5 +1,6 @@
 #include "record_head.h"
 #include "fast_math.h"
+#include "debug_trace.h"
 #include <cmath>
 
 // Soft limit on what is written: unchanged below kKnee, then bends smoothly toward 1.0.
@@ -42,6 +43,7 @@ void RecordHead::Start()
     for (int n = 0; n < 2; n++) trk_[n].age_init = trk_[n].mage_init = false;
     wob_len_ = wob_left_ = wob_gap_ = 0;
     last_k_ = -1;
+    ghost_left_ = fade_left_ = 0;
 }
 
 void RecordHead::SetPreRoll(float* l, float* r, size_t len, size_t phase)
@@ -159,6 +161,12 @@ void RecordHead::Process(double pos, float step, bool bounce, size_t region_star
     hist_lead_[h] = (long)lead;
     hist_gain_[h] = gain;
     if (++hist_i_ >= kLag) hist_i_ = 0;
+    TRACE_STAGE(kTrHead);
+    TRACE_SET(h_pos, (float)p);
+    TRACE_SET(h_step, s);
+    TRACE_SET(h_rs, (int32_t)rs);
+    TRACE_SET(h_rl, (int32_t)rl);
+    TRACE_SET(from, (float)from_);
 
     // Input low-pass, coefficient = tape speed (anti-aliasing when the tape runs slow).
     const float a = (fabsf(s) < 1.0f) ? fabsf(s) : 1.0f;
@@ -172,24 +180,25 @@ void RecordHead::Process(double pos, float step, bool bounce, size_t region_star
         from_ = p;
         start_ = rs;
         len_ = rl;
-        xf_ = xf;
-        xo_ = xo;
-        lead_ = ld;
         prev_l_ = x_now_l; prev_r_ = x_now_r;
         return;
     }
-    // The player changes the loop only at a wrap or bounce. Then move the head across that edge
-    // into the new loop; samples still on the old side of the edge are written to the old loop.
-    const long old_start = start_, old_len = len_, old_xf = xf_, old_xo = xo_, old_lead = lead_;
-    bool changed = false;
-    long edge = 0, shift = 0;
+    // The player changes the loop live (at a grain start, never near the loop edges while writing).
+    // Same place in the buffer (a length change): carry on in the new loop. Anywhere else the head
+    // jumps: a ghost keeps writing on the old track and fades out (cos^2) while the write at the
+    // new place fades in (sin^2), kTail samples each, so neither place gets a step.
     if (rs != start_ || rl != len_) {
-        changed = true;
-        const long old_edge = (s > 0.0f) ? old_len : 0;
-        if (s > 0.0f) edge = bounce ? rl : 0;
-        else          edge = bounce ? 0 : rl;
-        shift = edge - old_edge;
-        from_ += (double)shift;
+        const double old_abs = (double)start_ + from_;
+        const double new_abs = (double)rs + p;
+        if (fabs(new_abs - (old_abs + s)) < 4.0 || (bounce && fabs(new_abs - old_abs) < 4.0)) {
+            from_ = old_abs - (double)rs;
+        } else {
+            ghost_from_ = old_abs;
+            ghost_left_ = kTail;
+            fade_left_ = kTail;
+            wob_len_ = wob_left_ = wob_gap_ = 0;   // a stutter jerk does not carry over
+            from_ = p - s;
+        }
         start_ = rs;
         len_ = rl;
     } else {
@@ -205,17 +214,33 @@ void RecordHead::Process(double pos, float step, bool bounce, size_t region_star
         }
     }
 
-    // Buffer sample k is passed when the head crosses k + 0.5 on its way from from_ to from_ + s.
-    const double to = from_ + s;
-    long first = 0, count = 0, dir = 1;
-    if (s > 0.0f) {
-        first = (long)floor(from_ - 0.5) + 1;
-        count = (long)floor(to - 0.5) - first + 1;
-    } else if (s < 0.0f) {
-        dir = -1;
-        first = (long)ceil(from_ - 0.5) - 1;
-        count = first - (long)ceil(to - 0.5) + 1;
+    long first, count, dir;
+    // Ghost: absolute buffer samples on the old track, decay of the old layers + the input on the
+    // overdub track, no aging.
+    if (ghost_left_ > 0) {
+        Crossings(ghost_from_, s, first, count, dir);
+        TRACE_STAGE(kTrGhost);
+        TRACE_SET(ghost_from, (float)ghost_from_);
+        TRACE_SET(ghost_left, (int32_t)ghost_left_);
+        TRACE_SET(count, (int32_t)count);
+        for (long i = 0; i < count && ghost_left_ > 0; i++, ghost_left_--) {
+            const long k = first + i * dir;
+            if (k < 0 || k >= (long)cap_) continue;
+            const float t = (float)(((double)k + 0.5 - ghost_from_) / (double)s);
+            const float w = g * tail_w_[kTail - ghost_left_];
+            Track& b = trk_[0];
+            Track& o = trk_[1];
+            b.l[k] = Dub(b.l[k], b.l[k], 0.0f, w, keep);
+            b.r[k] = Dub(b.r[k], b.r[k], 0.0f, w, keep);
+            o.l[k] = Dub(o.l[k], o.l[k], prev_l_ + t * (x_now_l - prev_l_), w, keep);
+            o.r[k] = Dub(o.r[k], o.r[k], prev_r_ + t * (x_now_r - prev_r_), w, keep);
+        }
+        ghost_from_ += s;
     }
+    Crossings(from_, s, first, count, dir);
+    TRACE_SET(from, (float)from_);
+    TRACE_SET(count, (int32_t)count);
+    TRACE_SET(fade_left, (int32_t)fade_left_);
     dir_ = (dir > 0) ? 1 : -1;
     for (long i = 0; i < count; i++) {
         const long k = first + i * dir;
@@ -223,21 +248,38 @@ void RecordHead::Process(double pos, float step, bool bounce, size_t region_star
         const float t = (float)(((double)k + 0.5 - from_) / (double)s);
         const float x_l = prev_l_ + t * (x_now_l - prev_l_);
         const float x_r = prev_r_ + t * (x_now_r - prev_r_);
-        if (changed && ((s > 0.0f) ? (k < edge) : (k >= edge)))
-            Write(k - shift, bounce, (size_t)old_start, old_len, old_xf, old_xo, old_lead, x_l, x_r, g, keep);   // old loop
-        else
-            Write(k, bounce, (size_t)rs, rl, xf, xo, ld, x_l, x_r, g, keep);
+        float gg = g;
+        if (fade_left_ > 0) {   // after a jump: fade in, sin^2 = 1 - cos^2
+            gg *= 1.0f - tail_w_[kTail - fade_left_];
+            fade_left_--;
+        }
+        Write(k, bounce, (size_t)rs, rl, xf, xo, ld, x_l, x_r, gg, keep);
     }
     prev_l_ = x_now_l; prev_r_ = x_now_r;
     from_ = p;
-    xf_ = xf;
-    xo_ = xo;
-    lead_ = ld;
+}
+
+void RecordHead::Crossings(double from, float s, long& first, long& count, long& dir)
+{
+    const double to = from + s;
+    first = 0;
+    count = 0;
+    dir = 1;
+    if (s > 0.0f) {
+        first = (long)floor(from - 0.5) + 1;
+        count = (long)floor(to - 0.5) - first + 1;
+    } else if (s < 0.0f) {
+        dir = -1;
+        first = (long)ceil(from - 0.5) - 1;
+        count = first - (long)ceil(to - 0.5) + 1;
+    }
 }
 
 void RecordHead::Write(long k, bool bounce, size_t region_start, long region_len, long xf, long xo,
                        long lead, float x_l, float x_r, float gain, float keep)
 {
+    TRACE_STAGE(kTrWrite);
+    TRACE_SET(k, (int32_t)k);
     // Fold k into the region: mirror at the edges in ping-pong, wrap otherwise.
     if (bounce) {
         if (k < 0) k = -k - 1;
@@ -266,8 +308,15 @@ void RecordHead::Write(long k, bool bounce, size_t region_start, long region_len
     }
     last_k_ = k;
     const size_t i = region_start + (size_t)k;
+    TRACE_SET(wi, (int32_t)i);
+    TRACE_STAGE(kTrWobble);
     // Old layers of both tracks as read with the printed stutter: at k, or a little ahead of it.
-    const double rd = (double)k + Wobble(k, region_len, xf);
+    double rd = (double)k + Wobble(k, region_len, xf);
+    TRACE_STAGE(kTrWrite);
+    // A jerk that started before a direction change (mode switch, ping-pong turn) or a loop change
+    // can reach past the loop edge: keep the read inside the loop.
+    if (rd < 0.0) rd = 0.0;
+    else if (rd > (double)(region_len - 1)) rd = (double)(region_len - 1);
     const size_t j0 = region_start + (size_t)rd;
     const float fr = (float)(rd - floor(rd));
     float old_l[2], old_r[2];
@@ -326,6 +375,7 @@ void RecordHead::Write(long k, bool bounce, size_t region_start, long region_len
         }
         float* pl;
         float* pr;
+        TRACE_STAGE(kTrLead);
         if (!Slot(t, lead - (region_len - k), pl, pr)) continue;
         if (!t.mage_init) { t.mage_l = *pl; t.mage_r = *pr; t.mage_init = true; }
         t.mage_l += age_coef_ * (*pl + h * Noise() - t.mage_l);

@@ -40,11 +40,16 @@ static float ovd_pre_r[kOvdPre];
 static constexpr size_t kPreRoll = 48000 * 2;       // 2 s input history = lead-in of a recording
 static float DSY_SDRAM_BSS pre_l[2][kPreRoll];      // two rings: one live, one frozen
 static float DSY_SDRAM_BSS pre_r[2][kPreRoll];
+static constexpr size_t kLiveRing = 48000;          // 1 s ring: live input through the tape
+static float DSY_SDRAM_BSS live_l[kLiveRing];
+static float DSY_SDRAM_BSS live_r[kLiveRing];
+static LiveGrains live;                             // reads the live input at the tape speed
 
 // Written by main loop, read by audio callback
 static volatile bool  want_play    = false;
 static volatile bool  want_record  = false;
 static volatile bool  want_overdub = false;
+static volatile bool  want_live    = false;   // live input through the tape (P11 with nothing recorded)
 static volatile float battery = 0.5f;
 static volatile float range_a = 0.0f, range_b = 1.0f;
 static volatile int   mode = GrainPlayer::FORWARD;
@@ -74,6 +79,8 @@ static float   vol_s = 1.0f;      // smoothed output volume
 static float   mix_s = 0.5f;      // smoothed device / input mix
 static float   mixmode_s = 0.0f;  // 0 = normal output, 1 = mix output; 10 ms ramp between them
 static bool    head_ran = false;  // record head ran on the previous sample
+static bool    was_live = false;
+static float   live_gain = 0.0f;  // live input through the tape 0..1, 10 ms ramp
 static constexpr float kRecFade = 1.0f / 480.0f;   // overdub crossfade: 10 ms at 48 kHz
 static constexpr float kOverdubKeep = 0.891f;     // overdub: old layers -1 dB per pass (switch up)
 
@@ -221,6 +228,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
     bool play = want_play;
     bool rec  = want_record;
     bool od   = want_overdub;
+    bool live_on = want_live;
 
     // 2. Edge handling
     if (rec && !was_record) {
@@ -269,6 +277,12 @@ void AudioCallback(AudioHandle::InputBuffer in,
     const float tl = tilt;
     tilt_l.SetTilt(tl);
     tilt_r.SetTilt(tl);
+    // Live input through the tape: grains read the input at the tape speed (pitch follows the
+    // battery, wow and flutter; tempo stays live). The ring keeps running while there is no tape.
+    live.SetRatio(tape_speed);
+    if (live_on && !was_live) live.Reset();   // grains start at the delay behind the newest input
+    was_live = live_on;
+    const bool live_run = (length == 0) || live_on || live_gain > 0.0f;
 
     for (size_t i = 0; i < size; i++) {
         float in_l = in[0][i], in_r = in[1][i];
@@ -316,11 +330,18 @@ void AudioCallback(AudioHandle::InputBuffer in,
         head_ran = head_now;
         // Tape format character on the grains (enveloped) and on the monitored input; its hiss
         // sounds while the tape plays or the input goes to tape.
-        const float hiss = (e > mon_gain) ? e : mon_gain;
+        live_gain = live_on ? fminf(live_gain + kRecFade, 1.0f) : fmaxf(live_gain - kRecFade, 0.0f);
+        float lv_l = 0.0f, lv_r = 0.0f;
+        if (live_run) {
+            PROF_BEGIN(t_live);
+            live.Process(in_l, in_r, lv_l, lv_r);
+            PROF_END(kProfGrains, t_live);
+        }
+        const float hiss = fmaxf(fmaxf(e, mon_gain), live_gain);
         TRACE_STAGE(kTrTape);
         PROF_BEGIN(t_tape);
-        const float fl = tilt_l.Process(fmt_l.Process(l * e + mon_gain * in_l, hiss));
-        const float fr = tilt_r.Process(fmt_r.Process(r * e + mon_gain * in_r, hiss));
+        const float fl = tilt_l.Process(fmt_l.Process(l * e + mon_gain * in_l + live_gain * lv_l, hiss));
+        const float fr = tilt_r.Process(fmt_r.Process(r * e + mon_gain * in_r + live_gain * lv_r, hiss));
         PROF_END(kProfTape, t_tape);
         vol_s += 0.002f * (vol - vol_s);   // smoothed output volume (P01 + S35)
         mix_s += 0.002f * (mixv - mix_s);
@@ -328,7 +349,8 @@ void AudioCallback(AudioHandle::InputBuffer in,
         // Normal: device + dry input monitor when not going to tape. Mix mode (right switch down):
         // equal-power mix of the device output and the dry input. 10 ms crossfade between the two.
         const float dev = FastSinHalfPi(1.0f - mix_s), dry = FastSinHalfPi(mix_s);
-        const float nl = fl + (1.0f - mon_gain) * in_l, nr = fr + (1.0f - mon_gain) * in_r;
+        const float dry_g = fmaxf(1.0f - mon_gain - live_gain, 0.0f);   // dry input while not through the tape
+        const float nl = fl + dry_g * in_l, nr = fr + dry_g * in_r;
         const float ml = dev * fl + dry * in_l, mr = dev * fr + dry * in_r;
         out[0][i] = vol_s * (nl + mixmode_s * (ml - nl));
         out[1][i] = vol_s * (nr + mixmode_s * (mr - nr));
@@ -360,6 +382,7 @@ struct CpuScenario {
     int   mode;
     float battery, aging, type, fade, a, b;
     bool  play, overdub, moves;
+    bool  live;   // live input through the tape (forced on; rows without it: off)
 };
 static constexpr int kFwd = GrainPlayer::FORWARD, kBwd = GrainPlayer::BACKWARD, kPing = GrainPlayer::PINGPONG;
 static const CpuScenario kScenarios[] = {
@@ -376,6 +399,7 @@ static const CpuScenario kScenarios[] = {
     {"short 100 ms, aging max, fast", kFwd, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.0f,  true,  true,  false},
     {"  same, loop moving",           kFwd, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.0f,  true,  true,  true},
     {"  same, ping-pong, moving",     kPing, 1.0f, 1.0f, 1.0f, 2000.0f, 0.3f, 0.0f,  true,  true,  true},
+    {"live input, fastest, dictaphone", kFwd, 1.0f, 1.0f, 1.0f, 2000.0f, 0.3f, 0.374f, false, false, false, true},
 };
 
 static void PrintLoad(const char* label) {
@@ -437,6 +461,7 @@ static void CpuTestRun() {
             range_b = s.b;
             want_play = s.play;
             want_overdub = s.overdub;
+            want_live = s.live;
             const uint32_t t0 = System::GetNow();
             bool reset = false;
             while (System::GetNow() - t0 < 5000) {
@@ -490,6 +515,7 @@ int main(void) {
     fmt_r.Init(sr, 0x2545F491);   // different seed: independent hiss per channel
     tilt_l.Init(sr);
     tilt_r.Init(sr);
+    live.Init(live_l, live_r, kLiveRing, sr);
     motor.Init(hw.AudioCallbackRate());
     touch.Init(hw);
 #ifdef CPU_TEST
@@ -511,10 +537,12 @@ int main(void) {
             want_play = !want_play;
         } else if (pad == 10) {                 // P10: record start / stop (latched)
             if (want_record) { want_record = false; }
-            else { want_overdub = false; want_record = true; }
-        } else if (pad == 11) {                 // P11: overdub start / stop (latched)
+            else { want_overdub = false; want_live = false; want_record = true; }
+        } else if (pad == 11) {                 // P11: overdub start / stop (latched); nothing recorded: live input through the tape
             if (want_overdub) { want_overdub = false; }
+            else if (want_live) { want_live = false; }
             else if (!want_record && length > 0) { want_overdub = true; }
+            else if (!want_record) { want_live = true; }
         }
     });
 
@@ -580,7 +608,7 @@ int main(void) {
         if (sw == Switch3::POS_UP)        mode = GrainPlayer::FORWARD;
         else if (sw == Switch3::POS_DOWN) mode = GrainPlayer::BACKWARD;
         else                              mode = GrainPlayer::PINGPONG;
-        hw.SetLed(want_record || want_overdub);           // LED: recording or overdubbing
+        hw.SetLed(want_record || want_overdub || want_live);   // LED: recording, overdubbing or live input
         System::Delay(3);
     }
 }

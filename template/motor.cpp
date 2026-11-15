@@ -13,6 +13,7 @@ void Motor::Init(float update_rate)
     dt_ = 1.0f / update_rate;
     battery_ = 0.5f;
     wobble_ = 0.0f;
+    friction_ = 0.0f;
     speed_ = 1.0f;
     integ_ = 1.15f;
     deficit_ = 0.0f;
@@ -47,7 +48,8 @@ float Motor::Process()
     const float v   = (battery_ <= 0.5f) ? 0.3f + 1.4f * battery_ : 1.0f + (battery_ - 0.5f);
     const float cap = 1.3f * v;                        // most drive the battery can give
     // Tape load: mean 0.15, slowly and randomly varying by +-0.05.
-    const float load = 0.15f + 0.05f * SmoothRandom();
+    // Tape load + friction from a finger on the tape (SetFriction).
+    const float load = 0.15f + 0.05f * SmoothRandom() + friction_;
     // Over-voltage: from v = 1.2 to 1.5 the regulator gives way; its setpoint rises from
     // normal speed to what the full battery drive would give.
     const float fail   = clamp((v - 1.2f) / 0.3f, 0.0f, 1.0f);

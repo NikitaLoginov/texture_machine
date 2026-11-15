@@ -53,6 +53,7 @@ static volatile bool  want_record  = false;
 static volatile bool  want_overdub = false;
 static volatile bool  want_live    = false;   // live input through the tape (P11 with nothing recorded)
 static volatile float battery = 0.5f;
+static volatile float friction = 0.0f;   // P09 pressure: finger on the tape, extra motor load 0 .. 2
 static volatile float range_a = 0.0f, range_b = 1.0f;
 static volatile int   mode = GrainPlayer::FORWARD;
 static volatile float fade_ms = 200.0f, tape_type = 0.33f;
@@ -260,6 +261,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
     // Tape transport: battery -> tape speed, with wow/flutter for this tape type.
     const float type = tape_type;
     motor.SetBattery(battery);
+    motor.SetFriction(friction);
     motor.SetWobble(TapeFormat::Wobble(type));
     head.SetAging(age_coef, age_hiss, age_wob, age_wob_pitch);
     const float vol = volume;
@@ -580,6 +582,7 @@ int main(void) {
         const float t30 = 2.0f * ctl[0].Process(k.s30()) - 1.0f;
         tilt     = (fabsf(t30) < 0.03f) ? 0.0f : t30;   // small dead zone: the middle is exactly flat
         battery  = c31;                               // S31: battery 0 dead, 0.5 fresh, 1 over-voltage
+        friction = 2.0f * touch.pads().Pressure(9);   // P09: finger on the tape (pressure 0..1); full press stops it
         SetAgingFrom(c32, c34);                       // S32: overdub aging per pass, scaled by tape type (S34)
         fade_ms  = 10.0f + 1990.0f * c33;             // S33: loop crossfade, 10 ms..2 s
         tape_type = c34;                              // S34: tape type 0 reel-to-reel .. 1 dictaphone

@@ -68,7 +68,7 @@ void GrainPlayer::SetSpeed(float speed) {
 }
 
 void GrainPlayer::SetRatio(float ratio) {
-    if (ratio < 0.125f) ratio = 0.125f;   // -36 semitones
+    if (ratio < 0.0f) ratio = 0.0f;       // down to a stopped tape: grains follow the playhead
     else if (ratio > 8.0f) ratio = 8.0f;  // +36 semitones
     ratio_ = ratio;
 }

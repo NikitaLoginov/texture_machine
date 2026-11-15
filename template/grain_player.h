@@ -10,7 +10,7 @@ public:
     void SetRange(float a, float b);   // loop start a (0..1 of length), b = loop length 0..1 (exponential, 100 ms .. the rest after the start); applied live at the next grain start (see Process), or on Reset()
     void SetMode(Mode mode);
     void SetSpeed(float speed);        // playhead speed, 1 = normal, 0 = freeze, clamp to >= 0
-    void SetRatio(float ratio);        // grain read speed (pitch), clamp 1/8..8 (+-36 semitones)
+    void SetRatio(float ratio);        // grain read speed (pitch) = tape speed, clamp 0..8 (0 = stopped tape)
     void SetGrainMs(float ms);         // grain length in ms, clamp 5..1000
     void SetFadeMs(float ms);          // loop crossfade length, clamp 1..2000
     void SetWriting(bool writing) { writing_ = writing; }   // the record head writes: hold loop changes near the loop edges

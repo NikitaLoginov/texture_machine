@@ -5,6 +5,7 @@ namespace {
 const float kKp = 20.0f;
 const float kKi = 400.0f;
 const float kTau = 0.08f;    // motor inertia, s
+const float kFingerFloor = 0.1f;   // a finger on the tape never quite stops it: 9 .. 11 % speed
 const float kTwoPi = 6.28318530718f;
 }
 
@@ -49,7 +50,8 @@ float Motor::Process()
     const float cap = 1.3f * v;                        // most drive the battery can give
     // Tape load: mean 0.15, slowly and randomly varying by +-0.05.
     // Tape load + friction from a finger on the tape (SetFriction).
-    const float load = 0.15f + 0.05f * SmoothRandom() + friction_;
+    const float rnd = SmoothRandom();
+    const float load = 0.15f + 0.05f * rnd + friction_;
     // Over-voltage: from v = 1.2 to 1.5 the regulator gives way; its setpoint rises from
     // normal speed to what the full battery drive would give.
     const float fail   = clamp((v - 1.2f) / 0.3f, 0.0f, 1.0f);
@@ -61,6 +63,9 @@ float Motor::Process()
     // Motor inertia: settles at speed = drive - load.
     speed_ += (drive - load - speed_) * dt_ / kTau;
     if (speed_ < 0.0f) speed_ = 0.0f;
+    // With a finger on the tape the speed stays above 9 .. 11 %, drifting with the load's random.
+    const float floor_speed = kFingerFloor * (1.0f + 0.1f * rnd);
+    if (friction_ > 0.0f && speed_ < floor_speed) speed_ = floor_speed;
     // Battery weakness: 0 for v >= 0.9, 1 at the dead end.
     deficit_ = clamp((0.9f - v) / 0.6f, 0.0f, 1.0f);
     // Tape-path wow (0.7 Hz) and flutter (8 Hz), stronger when the battery is weak.

@@ -36,7 +36,9 @@ void TapeFormat::SetParams(float type, float deficit, float speed, float drive, 
     norm_ = fminf(0.5f / tanhf(0.5f * drive_), kMaxLift / drive_);
     // Head bump: resonant peak just above the tape's low cut (twice the high-pass frequency, so it
     // moves with tape type and speed), Q 2, 0 .. +9 dB (RBJ peaking EQ).
-    const float f0 = fminf(2.0f * hp_freq, 0.45f * sr_);
+    // At least 20 Hz: with the tape stopped (speed 0) a 0 Hz peaking filter is at its stability
+    // limit in float and its state can drift.
+    const float f0 = fminf(fmaxf(2.0f * hp_freq, 20.0f), 0.45f * sr_);
     const float a = powf(10.0f, 9.0f * bump / 40.0f);
     const float w0 = 6.2831853f * f0 / sr_;
     const float alpha = sinf(w0) / (2.0f * 2.0f);

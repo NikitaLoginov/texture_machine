@@ -270,6 +270,9 @@ void AudioCallback(AudioHandle::InputBuffer in,
     const float mixmode = mix_mode ? 1.0f : 0.0f;
     const float tape_speed = motor.Process();
     const float deficit    = motor.Deficit();
+    // Head output follows the tape speed below 0.2: a stopped tape is silent (a dead battery,
+    // ~0.23, is above it).
+    const float head_lvl = fminf(5.0f * tape_speed, 1.0f);
     TRACE_SET(speed, tape_speed);
     player.SetMode((GrainPlayer::Mode)mode);
     player.SetSpeed(tape_speed);
@@ -345,11 +348,11 @@ void AudioCallback(AudioHandle::InputBuffer in,
             wear.Process(lv_l, lv_r);   // generation noise (S32)
             PROF_END(kProfGrains, t_live);
         }
-        const float hiss = fmaxf(fmaxf(e, mon_gain), live_gain);
+        const float hiss = fmaxf(fmaxf(e * head_lvl, mon_gain), live_gain * head_lvl);
         TRACE_STAGE(kTrTape);
         PROF_BEGIN(t_tape);
-        const float fl = tilt_l.Process(fmt_l.Process(l * e + mon_gain * in_l + live_gain * lv_l, hiss));
-        const float fr = tilt_r.Process(fmt_r.Process(r * e + mon_gain * in_r + live_gain * lv_r, hiss));
+        const float fl = tilt_l.Process(fmt_l.Process(head_lvl * (l * e + live_gain * lv_l) + mon_gain * in_l, hiss));
+        const float fr = tilt_r.Process(fmt_r.Process(head_lvl * (r * e + live_gain * lv_r) + mon_gain * in_r, hiss));
         PROF_END(kProfTape, t_tape);
         vol_s += 0.002f * (vol - vol_s);   // smoothed output volume (P01 + S35)
         mix_s += 0.002f * (mixv - mix_s);
@@ -493,6 +496,9 @@ int main(void) {
     TraceBoot();
     hw.StartLog(false);
 #endif
+#ifdef PAD_TEST
+    hw.StartLog(false);   // pad test: P09 pressure over USB serial
+#endif
     hw.SetAudioBlockSize(16);
     hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
 
@@ -526,6 +532,10 @@ int main(void) {
     live.Init(live_l, live_r, kLiveRing, sr);
     motor.Init(hw.AudioCallbackRate());
     touch.Init(hw);
+    touch.pads().SetMaxDelta(9, 520.0f);   // P09 (finger on the tape): measured light ~120, medium ~410, hard ~520
+#ifdef PAD_TEST
+    touch.pads().SetMaxDelta(9, 1000.0f);   // pad test: see P09's full range (normal: 425)
+#endif
 #ifdef CPU_TEST
     CpuTestFill();
     hw.StartAudio(AudioCallback);
@@ -582,7 +592,23 @@ int main(void) {
         const float t30 = 2.0f * ctl[0].Process(k.s30()) - 1.0f;
         tilt     = (fabsf(t30) < 0.03f) ? 0.0f : t30;   // small dead zone: the middle is exactly flat
         battery  = c31;                               // S31: battery 0 dead, 0.5 fresh, 1 over-voltage
-        friction = 2.0f * touch.pads().Pressure(9);   // P09: finger on the tape (pressure 0..1); full press stops it
+        const float p09 = touch.pads().Pressure(9);
+        friction = 2.0f * p09 * p09 * p09;            // P09: finger on the tape (pressure 0..1, gentle start); full press: 9-11 % speed
+#ifdef PAD_TEST
+        // Pad test (build with C_DEFS=-DPAD_TEST): P09 while touched, every 50 ms. The pad's
+        // curve is pressure = norm^2, norm = (delta - 5) / (max delta - 5): print the implied delta.
+        static uint32_t pad_t = 0;
+        if (touch.pads().IsTouched(9) && System::GetNow() - pad_t >= 50) {
+            pad_t = System::GetNow();
+            const float norm = sqrtf(p09);
+            const int max_d = (int)touch.pads().MaxDelta(9);
+            const int delta = (int)(5.0f + norm * (float)(max_d - 5));
+            const int p_m = (int)(p09 * 1000.0f), n_m = (int)(norm * 1000.0f);
+            const int f_m = (int)(2.0f * p09 * p09 * p09 * 1000.0f);
+            hw.PrintLine("P09 pressure %d.%03d  norm %d.%03d  delta ~%d of %d  friction %d.%03d",
+                         p_m / 1000, p_m % 1000, n_m / 1000, n_m % 1000, delta, max_d, f_m / 1000, f_m % 1000);
+        }
+#endif
         SetAgingFrom(c32, c34);                       // S32: overdub aging per pass, scaled by tape type (S34)
         fade_ms  = 10.0f + 1990.0f * c33;             // S33: loop crossfade, 10 ms..2 s
         tape_type = c34;                              // S34: tape type 0 reel-to-reel .. 1 dictaphone

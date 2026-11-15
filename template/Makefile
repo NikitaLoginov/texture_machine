@@ -22,6 +22,12 @@ LIBDAISY_DIR ?= ../lib/libDaisy
 DAISYSP_DIR ?= ../lib/DaisySP
 
 SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
+
+# Test build (like the core Makefile's `ifdef DEBUG`): make PAD_TEST=1 ...
+ifdef PAD_TEST
+C_DEFS += -DPAD_TEST
+endif
+
 include $(SYSTEM_FILES_DIR)/Makefile
 
 libs:

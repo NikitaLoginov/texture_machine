@@ -11,6 +11,8 @@
 #include "live_grains.h"
 #include "live_wear.h"
 #include "window_shock.h"
+#include "crush.h"
+#include "beat_repeat.h"
 #include "debug_trace.h"
 #include <cmath>
 
@@ -42,12 +44,16 @@ static float ovd_pre_r[kOvdPre];
 static constexpr size_t kPreRoll = 48000 * 2;       // 2 s input history = lead-in of a recording
 static float DSY_SDRAM_BSS pre_l[2][kPreRoll];      // two rings: one live, one frozen
 static float DSY_SDRAM_BSS pre_r[2][kPreRoll];
-static constexpr size_t kLiveRing = 48000;          // 1 s ring: live input through the tape
-static float DSY_SDRAM_BSS live_l[kLiveRing];
-static float DSY_SDRAM_BSS live_r[kLiveRing];
-static LiveGrains live;                             // reads the live input at the tape speed
+static LiveGrains live;                             // reads the live input (the input history ring) at the tape speed
+static int    live_ring = 0;     // input history ring the live grains read (kept while live mode fades out)
+static size_t live_newest = 0;   // index of its newest sample
+static constexpr size_t kRepeatRing = 48000 / 4 + 4096;   // beat repeat ring, fx box mode only: slices up to 250 ms
+static float DSY_SDRAM_BSS rep_l[kRepeatRing];
+static float DSY_SDRAM_BSS rep_r[kRepeatRing];
+static BeatRepeat repeat;                           // P07 held: beat repeat
 static LiveWear   wear;                             // S32 on the live input: noise, stutter
 static WindowShock shock;                           // P08 held: damaged tape under the head
+static Crush       crush;                           // P02 held: bits / sample rate down on the output
 
 // Written by main loop, read by audio callback
 static volatile bool  want_play    = false;
@@ -57,6 +63,10 @@ static volatile bool  want_live    = false;   // live input through the tape (P1
 static volatile float battery = 0.5f;
 static volatile float friction = 0.0f;   // P09 pressure: finger on the tape, extra motor load 0 .. 2
 static volatile float shock_sev = 0.0f;  // P08 pressure: window shock severity 0 .. 1
+static volatile float crush_amt = 0.0f;  // P02 pressure: crush amount 0 .. 1
+static volatile bool  rep_on = false;    // P07 touched: beat repeat
+static volatile float rep_div = 4.0f;    // its division of the loop: 4, 8, 16, 32 (P07 pressure)
+static volatile float glitch_amt = 0.0f; // P06: share of grains that jump (glitch) 0 .. 1
 static volatile float range_a = 0.0f, range_b = 1.0f;
 static volatile int   mode = GrainPlayer::FORWARD;
 static volatile float fade_ms = 200.0f, tape_type = 0.33f;
@@ -278,6 +288,14 @@ void AudioCallback(AudioHandle::InputBuffer in,
     const float head_lvl = fminf(5.0f * tape_speed, 1.0f);
     // Window shock (P08) only while the tape moves, weaker with the head output.
     shock.SetSeverity((play || live_on) ? shock_sev * head_lvl : 0.0f);
+    crush.SetAmount(crush_amt);
+    // Beat repeat (P07): in tape mode the grain player repeats a slice of the tape itself (loop /
+    // division, tape samples, so the rhythm follows the tape speed); in fx box mode the BeatRepeat
+    // ring repeats the live signal (nominal 1 s bar / division). Only while the tape moves.
+    player.SetRepeat(rep_on && play && !live_on, (double)player.RegionLen() / rep_div);
+    repeat.Set(rep_on && live_on, 48000.0f / rep_div);
+    player.SetGlitch(glitch_amt);   // P06: grains jump to random places (tape and fx box mode)
+    live.SetGlitch(glitch_amt);
     TRACE_SET(speed, tape_speed);
     player.SetMode((GrainPlayer::Mode)mode);
     player.SetSpeed(tape_speed);
@@ -295,6 +313,10 @@ void AudioCallback(AudioHandle::InputBuffer in,
     // battery, wow and flutter; tempo stays live). The ring keeps running while there is no tape.
     wear.SetAging(age_amount, age_coef, age_hiss, age_wob, age_wob_pitch);
     live.SetRatio(tape_speed * wear.SpeedFactor((int)size));   // + stutter jerks (S32)
+    // The live grains read the input history ring; while live mode is on or fading out they stay
+    // on their ring (a record start switches the writing to the other ring).
+    if (!(live_on || live_gain > 0.0f)) live_ring = pre_live;
+    live.SetRing(pre_l[live_ring], pre_r[live_ring], kPreRoll);
     if (live_on && !was_live) live.Reset();   // grains start at the delay behind the newest input
     was_live = live_on;
     const bool live_run = (length == 0) || live_on || live_gain > 0.0f;
@@ -349,7 +371,8 @@ void AudioCallback(AudioHandle::InputBuffer in,
         float lv_l = 0.0f, lv_r = 0.0f;
         if (live_run) {
             PROF_BEGIN(t_live);
-            live.Process(in_l, in_r, lv_l, lv_r);
+            if (live_ring == pre_live) live_newest = (pre_pos > 0) ? pre_pos - 1 : kPreRoll - 1;
+            live.Process(live_newest, lv_l, lv_r);
             wear.Process(lv_l, lv_r);   // generation noise (S32)
             PROF_END(kProfGrains, t_live);
         }
@@ -358,9 +381,11 @@ void AudioCallback(AudioHandle::InputBuffer in,
         PROF_BEGIN(t_tape);
         // Tape signal (playback + live input), with the window shock (P08) on it.
         float tp_l = head_lvl * (l * e + live_gain * lv_l), tp_r = head_lvl * (r * e + live_gain * lv_r);
+        if (live_run) repeat.Process(tp_l, tp_r);   // P07 in fx box mode (tape mode: in the grain player)
         shock.Process(tp_l, tp_r);
-        const float fl = tilt_l.Process(fmt_l.Process(tp_l + mon_gain * in_l, hiss));
-        const float fr = tilt_r.Process(fmt_r.Process(tp_r + mon_gain * in_r, hiss));
+        float fl = tilt_l.Process(fmt_l.Process(tp_l + mon_gain * in_l, hiss));
+        float fr = tilt_r.Process(fmt_r.Process(tp_r + mon_gain * in_r, hiss));
+        crush.Process(fl, fr);   // P02: crush on the device output (not the dry input)
         PROF_END(kProfTape, t_tape);
         vol_s += 0.002f * (vol - vol_s);   // smoothed output volume (P01 + S35)
         mix_s += 0.002f * (mixv - mix_s);
@@ -403,6 +428,7 @@ struct CpuScenario {
     bool  play, overdub, moves;
     bool  live;   // live input through the tape (forced on; rows without it: off)
     bool  shock;  // window shock (P08) at full severity (rows without it: off)
+    bool  fx;     // every pad effect at full: shock, crush, beat repeat /32, glitch (rows without it: off)
 };
 static constexpr int kFwd = GrainPlayer::FORWARD, kBwd = GrainPlayer::BACKWARD, kPing = GrainPlayer::PINGPONG;
 static const CpuScenario kScenarios[] = {
@@ -421,6 +447,7 @@ static const CpuScenario kScenarios[] = {
     {"  same, ping-pong, moving",     kPing, 1.0f, 1.0f, 1.0f, 2000.0f, 0.3f, 0.0f,  true,  true,  true},
     {"live input, fastest, dictaphone", kFwd, 1.0f, 1.0f, 1.0f, 2000.0f, 0.3f, 0.374f, false, false, false, true},
     {"short p-p moving + shock",      kPing, 1.0f, 1.0f, 1.0f, 2000.0f, 0.3f, 0.0f,  true,  true,  true, false, true},
+    {"short p-p moving + all fx",     kPing, 1.0f, 1.0f, 1.0f, 2000.0f, 0.3f, 0.0f,  true,  true,  true, false, true, true},
 };
 
 static void PrintLoad(const char* label) {
@@ -483,7 +510,11 @@ static void CpuTestRun() {
             want_play = s.play;
             want_overdub = s.overdub;
             want_live = s.live;
-            shock_sev = s.shock ? 1.0f : 0.0f;
+            shock_sev = (s.shock || s.fx) ? 1.0f : 0.0f;
+            crush_amt = s.fx ? 1.0f : 0.0f;
+            rep_on = s.fx;
+            rep_div = 32.0f;
+            glitch_amt = s.fx ? 1.0f : 0.0f;
             const uint32_t t0 = System::GetNow();
             bool reset = false;
             while (System::GetNow() - t0 < 5000) {
@@ -506,9 +537,6 @@ int main(void) {
 #ifdef DEBUG_TRACE
     TraceBoot();
     hw.StartLog(false);
-#endif
-#ifdef PAD_TEST
-    hw.StartLog(false);   // pad test: P09 pressure over USB serial
 #endif
     hw.SetAudioBlockSize(16);
     hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
@@ -540,16 +568,16 @@ int main(void) {
     fmt_r.Init(sr, 0x2545F491);   // different seed: independent hiss per channel
     tilt_l.Init(sr);
     tilt_r.Init(sr);
-    live.Init(live_l, live_r, kLiveRing, sr);
+    live.Init(sr);
+    repeat.Init(rep_l, rep_r, kRepeatRing);
     motor.Init(hw.AudioCallbackRate());
     touch.Init(hw);
     touch.pads().SetMaxDelta(9, 530.0f);   // P09 (finger on the tape): measured light 5-120, medium ~410, hard 505-527
     touch.pads().SetMaxDelta(8, 540.0f);   // P08 (window shock): measured light 20-145, medium ~500, hard 530-538
+    touch.pads().SetMaxDelta(2, 535.0f);   // P02 (crush): like P08/P09 (their hard press tops out at ~525-535)
+    touch.pads().SetMaxDelta(7, 535.0f);   // P07 (beat repeat): like P08/P09
+    touch.pads().SetMaxDelta(6, 535.0f);   // P06 (glitch): like P08/P09
     shock.Init(sr);
-#ifdef PAD_TEST
-    touch.pads().SetMaxDelta(9, 1000.0f);   // pad test: see P09's full range (normal: 425)
-    touch.pads().SetMaxDelta(8, 1000.0f);   // pad test: P08's full range too
-#endif
 #ifdef CPU_TEST
     CpuTestFill();
     hw.StartAudio(AudioCallback);
@@ -609,31 +637,12 @@ int main(void) {
         const float p09 = touch.pads().Pressure(9);
         friction = 2.0f * p09 * p09 * p09;            // P09: finger on the tape (pressure 0..1, gentle start); full press: 9-11 % speed
         shock_sev = touch.pads().Pressure(8);         // P08: window shock (damaged tape), pressure = severity
-#ifdef PAD_TEST
-        // Pad test (build with C_DEFS=-DPAD_TEST): P09 while touched, every 50 ms. The pad's
-        // curve is pressure = norm^2, norm = (delta - 5) / (max delta - 5): print the implied delta.
-        static uint32_t pad_t = 0;
-        if (touch.pads().IsTouched(9) && System::GetNow() - pad_t >= 50) {
-            pad_t = System::GetNow();
-            const float norm = sqrtf(p09);
-            const int max_d = (int)touch.pads().MaxDelta(9);
-            const int delta = (int)(5.0f + norm * (float)(max_d - 5));
-            const int p_m = (int)(p09 * 1000.0f), n_m = (int)(norm * 1000.0f);
-            const int f_m = (int)(2.0f * p09 * p09 * p09 * 1000.0f);
-            hw.PrintLine("P09 pressure %d.%03d  norm %d.%03d  delta ~%d of %d  friction %d.%03d",
-                         p_m / 1000, p_m % 1000, n_m / 1000, n_m % 1000, delta, max_d, f_m / 1000, f_m % 1000);
-        }
-        static uint32_t pad8_t = 0;
-        if (touch.pads().IsTouched(8) && System::GetNow() - pad8_t >= 50) {
-            pad8_t = System::GetNow();
-            const float p08 = touch.pads().Pressure(8);
-            const float norm = sqrtf(p08);
-            const int max_d = (int)touch.pads().MaxDelta(8);
-            const int delta = (int)(5.0f + norm * (float)(max_d - 5));
-            const int p_m = (int)(p08 * 1000.0f);
-            hw.PrintLine("P08 pressure %d.%03d  delta ~%d of %d", p_m / 1000, p_m % 1000, delta, max_d);
-        }
-#endif
+        crush_amt = touch.pads().Pressure(2);         // P02: crush, pressure = amount
+        // P07: beat repeat while touched; pressure picks the division (harder = shorter slice).
+        rep_on = touch.pads().IsTouched(7);
+        const float n07 = sqrtf(touch.pads().Pressure(7));
+        rep_div = (n07 < 0.4f) ? 4.0f : (n07 < 0.6f) ? 8.0f : (n07 < 0.8f) ? 16.0f : 32.0f;
+        glitch_amt = sqrtf(touch.pads().Pressure(6));   // P06: glitch, 0 when not touched
         SetAgingFrom(c32, c34);                       // S32: overdub aging per pass, scaled by tape type (S34)
         fade_ms  = 10.0f + 1990.0f * c33;             // S33: loop crossfade, 10 ms..2 s
         tape_type = c34;                              // S34: tape type 0 reel-to-reel .. 1 dictaphone

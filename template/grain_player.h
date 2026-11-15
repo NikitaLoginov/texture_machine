@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <cstdint>
 
 class GrainPlayer {
 public:
@@ -14,6 +15,9 @@ public:
     void SetGrainMs(float ms);         // grain length in ms, clamp 5..1000
     void SetFadeMs(float ms);          // loop crossfade length, clamp 1..2000
     void SetWriting(bool writing) { writing_ = writing; }   // the record head writes: hold loop changes near the loop edges
+    void SetGlitch(float amount) { glitch_ = (amount < 0.0f) ? 0.0f : (amount > 1.0f ? 1.0f : amount); }   // P06: share of grains that jump to random places (once per block)
+    // P07 beat repeat in tape mode (once per block): held, and the slice length in tape samples.
+    void SetRepeat(bool hold, double slice) { rep_hold_ = hold; rep_next_len_ = (slice < 2.0 * kRepXf) ? 2.0 * kRepXf : slice; }
 
     // Lead-in: the input just before the recording, a ring of len samples per channel whose
     // oldest sample is at index phase. Lead-in sample j (-len .. -1, -1 = just before the
@@ -90,4 +94,18 @@ private:
     double off_[2];     // per-grain read offset from start_, advanced by gdir_ * ratio_
     double gbase_[2];   // per-grain loop (start, length): the playhead's loop when the grain started
     double glen_[2];
+    float glitch_;      // P06 glitch amount: chance that a starting grain jumps
+    uint32_t seed_;     // random state for the glitch
+    float Rand01();     // 0 .. 1
+
+    // Beat repeat reader (P07, tape mode).
+    static constexpr double kRepXf = 288.0;           // slice wrap crossfade, tape samples (6 ms)
+    static constexpr float kRepRel = 1.0f / 480.0f;   // release crossfade step (10 ms)
+    bool rep_hold_, rep_on_, rep_first_;   // held; repeating; still in its first pass (= the playback)
+    float rep_g_;                          // repeat share: 0 = grains .. 1 = repeat
+    float rep_dir_;                        // playback direction at the press
+    double rep_base_, rep_n_;              // the loop at the press (start, length)
+    double rep_start_;                     // slice start in that loop
+    double rep_q_;                         // read position in the slice, tape samples
+    double rep_len_, rep_next_len_;        // slice length now / from the next wrap on
 };

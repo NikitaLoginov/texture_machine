@@ -23,6 +23,13 @@ void GrainPlayer::Init(const float* buf_l, const float* buf_r, size_t capacity, 
     range_a_ = 0.0f;
     range_b_ = 1.0f;
     writing_ = false;
+    glitch_ = 0.0f;
+    seed_ = 0xBB67AE85u;
+    rep_hold_ = rep_on_ = rep_first_ = false;
+    rep_g_ = 0.0f;
+    rep_dir_ = 1.0f;
+    rep_base_ = rep_n_ = rep_start_ = rep_q_ = 0.0;
+    rep_len_ = rep_next_len_ = 2.0 * kRepXf;
     mode_ = FORWARD;
     speed_ = 1.0f;
     ratio_ = 1.0f;
@@ -175,6 +182,19 @@ void GrainPlayer::StartGrain(int g) {
     off_[g] = 0.0;
     gbase_[g] = region_start_;
     glen_[g] = region_len_;
+    // Glitch (P06): sometimes the grain starts at a random place in the loop instead, some
+    // backwards. The playhead is not affected.
+    if (glitch_ > 0.0f && Rand01() < glitch_) {
+        start_[g] = (double)Rand01() * region_len_;
+        if (Rand01() < 0.3f) gdir_[g] = -gdir_[g];
+    }
+}
+
+float GrainPlayer::Rand01() {
+    seed_ ^= seed_ << 13;
+    seed_ ^= seed_ >> 17;
+    seed_ ^= seed_ << 5;
+    return (float)(seed_ >> 8) * (1.0f / 16777216.0f);
 }
 
 double GrainPlayer::Wrap(double x, double len) {
@@ -339,21 +359,77 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
     if (prev < 0.5f && phase_ >= 0.5f) StartGrain(1);
 
     TRACE_STAGE(kTrRead);
-    float l, r;
+    float l = 0.0f, r = 0.0f;
     const double rel0 = Wrap(start_[0] + off_[0], glen_[0]);
     const double rel1 = Wrap(start_[1] + off_[1], glen_[1]);
-    if (gbase_[0] == gbase_[1] && glen_[0] == glen_[1] && fabs(rel0 - rel1) < 1e-6) {
-        // Both grains read the same point of the same loop (the usual case: they ride the
-        // playhead) and their Hann windows add up to exactly 1, so one read is the whole output.
-        ReadAt(rel0, (long)gbase_[0], (long)glen_[0], l, r);
-    } else {
-        // Grain 1's window is 1 - grain 0's (50 % overlap).
-        float l0, r0, l1, r1;
-        ReadAt(rel0, (long)gbase_[0], (long)glen_[0], l0, r0);
-        ReadAt(rel1, (long)gbase_[1], (long)glen_[1], l1, r1);
-        const float w0 = 0.5f - 0.5f * cosf(kTwoPi * phase_);
-        l = l1 + w0 * (l0 - l1);
-        r = r1 + w0 * (r0 - r1);
+    const bool coincide = gbase_[0] == gbase_[1] && glen_[0] == glen_[1] && fabs(rel0 - rel1) < 1e-6;
+
+    // Beat repeat (P07, tape mode): a repeat reader starts at the playhead and moves at the tape
+    // speed, wraps around the slice with a kRepXf crossfade into the tape just before the slice
+    // start. Its first pass is the playback itself: if the grains are on the playhead it switches
+    // at once, else (glitch, loop change) it fades in. Release crossfades back to the grains
+    // (at once while still in the first pass). The playhead and the record head run on.
+    if (rep_hold_ && !rep_on_ && rep_g_ == 0.0f) {
+        rep_on_ = true;
+        rep_base_ = region_start_;
+        rep_n_ = region_len_;
+        rep_start_ = pos_;
+        rep_dir_ = dir_;
+        rep_q_ = 0.0;
+        rep_len_ = rep_next_len_;
+        rep_first_ = coincide && gbase_[0] == region_start_ && glen_[0] == region_len_ && fabs(rel0 - pos_) < 0.01;
+        rep_g_ = rep_first_ ? 1.0f : 0.0f;
+    }
+    if (rep_on_ && rep_first_ && dir_ != rep_dir_) rep_first_ = false;   // ping-pong bounce: not the playback any more
+    if (!rep_hold_) {
+        if (rep_on_ && rep_first_) rep_g_ = 0.0f;
+        rep_on_ = false;
+    }
+
+    // Grains (skipped while the repeat is fully in: inaudible).
+    if (!(rep_on_ && rep_g_ >= 1.0f)) {
+        if (coincide) {
+            // Both grains read the same point of the same loop (the usual case: they ride the
+            // playhead) and their Hann windows add up to exactly 1, so one read is the whole output.
+            ReadAt(rel0, (long)gbase_[0], (long)glen_[0], l, r);
+        } else {
+            // Grain 1's window is 1 - grain 0's (50 % overlap).
+            float l0, r0, l1, r1;
+            ReadAt(rel0, (long)gbase_[0], (long)glen_[0], l0, r0);
+            ReadAt(rel1, (long)gbase_[1], (long)glen_[1], l1, r1);
+            const float w0 = 0.5f - 0.5f * cosf(kTwoPi * phase_);
+            l = l1 + w0 * (l0 - l1);
+            r = r1 + w0 * (r0 - r1);
+        }
+    }
+
+    if (rep_on_ || rep_g_ > 0.0f) {
+        float vl, vr;
+        ReadAt(Wrap(rep_start_ + rep_dir_ * rep_q_, rep_n_), (long)rep_base_, (long)rep_n_, vl, vr);
+        const double k = rep_q_ - (rep_len_ - kRepXf);
+        if (k >= 0.0) {
+            const float u = (float)(k / kRepXf);
+            const float c = FastSinHalfPi(1.0f - u), s = FastSinHalfPi(u);
+            float ll, lr;
+            ReadAt(Wrap(rep_start_ + rep_dir_ * (k - kRepXf), rep_n_), (long)rep_base_, (long)rep_n_, ll, lr);
+            vl = c * vl + s * ll;
+            vr = c * vr + s * lr;
+        }
+        rep_q_ += speed_;
+        if (rep_q_ >= rep_len_) {
+            rep_q_ -= rep_len_;
+            rep_len_ = rep_next_len_;   // a new length (division) from the next pass on
+            rep_first_ = false;
+        }
+        rep_g_ = rep_on_ ? fminf(rep_g_ + kRepRel, 1.0f) : fmaxf(rep_g_ - kRepRel, 0.0f);
+        if (rep_g_ >= 1.0f) {   // fully in: the output is the repeat
+            l = vl;
+            r = vr;
+        } else {
+            const float w = FastSinHalfPi(rep_g_), c = FastSinHalfPi(1.0f - rep_g_);
+            l = c * l + w * vl;
+            r = c * r + w * vr;
+        }
     }
 
     // Advance grain read offsets (integrated, so ratio changes don't make grains jump).

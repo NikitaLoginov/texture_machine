@@ -8,6 +8,7 @@
 #include "record_head.h"
 #include "fast_math.h"
 #include "tilt_eq.h"
+#include "live_grains.h"
 #include "debug_trace.h"
 #include <cmath>
 

@@ -13,6 +13,7 @@
 #include "window_shock.h"
 #include "crush.h"
 #include "beat_repeat.h"
+#include "phaser.h"
 #include "debug_trace.h"
 #include <cmath>
 
@@ -54,6 +55,7 @@ static BeatRepeat repeat;                           // P07 held: beat repeat
 static LiveWear   wear;                             // S32 on the live input: noise, stutter
 static WindowShock shock;                           // P08 held: damaged tape under the head
 static Crush       crush;                           // P02 held: bits / sample rate down on the output
+static ::Phaser    phaser;                          // P05 held: vintage 4-stage phaser on the output
 
 // Written by main loop, read by audio callback
 static volatile bool  want_play    = false;
@@ -64,6 +66,7 @@ static volatile float battery = 0.5f;
 static volatile float friction = 0.0f;   // P09 pressure: finger on the tape, extra motor load 0 .. 2
 static volatile float shock_sev = 0.0f;  // P08 pressure: window shock severity 0 .. 1
 static volatile float crush_amt = 0.0f;  // P02 pressure: crush amount 0 .. 1
+static volatile float phaser_p = 0.0f;   // P05 pressure: phaser depth + speed 0 .. 1
 static volatile bool  rep_on = false;    // P07 touched: beat repeat
 static volatile float rep_div = 4.0f;    // its division of the loop: 4, 8, 16, 32 (P07 pressure)
 static volatile float glitch_amt = 0.0f; // P06: share of grains that jump (glitch) 0 .. 1
@@ -177,12 +180,12 @@ static void TraceBoot() {
     SCB->SHCSR |= SCB_SHCSR_MEMFAULTENA_Msk | SCB_SHCSR_BUSFAULTENA_Msk | SCB_SHCSR_USGFAULTENA_Msk;
 }
 
-// Independent watchdog: resets the device if the main loop stops refreshing it for 1 s.
-static void TraceWatchdogStart() {
+// Independent watchdog: resets the device if it is not refreshed for ms milliseconds (max ~4 s).
+static void TraceWatchdogStart(uint32_t ms) {
     IWDG1->KR = 0xCCCC;   // start
     IWDG1->KR = 0x5555;   // unlock the settings
     IWDG1->PR = 3;        // LSI 32 kHz / 32 = 1 kHz
-    IWDG1->RLR = 1000;    // 1 s
+    IWDG1->RLR = (ms > 4095) ? 4095 : ms;   // 1 ms per count
     while (IWDG1->SR != 0) {}
     IWDG1->KR = 0xAAAA;   // refresh
 }
@@ -289,6 +292,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
     // Window shock (P08) only while the tape moves, weaker with the head output.
     shock.SetSeverity((play || live_on) ? shock_sev * head_lvl : 0.0f);
     crush.SetAmount(crush_amt);
+    phaser.SetPressure(phaser_p, (int)size);
     // Beat repeat (P07): in tape mode the grain player repeats a slice of the tape itself (loop /
     // division, tape samples, so the rhythm follows the tape speed); in fx box mode the BeatRepeat
     // ring repeats the live signal (nominal 1 s bar / division). Only while the tape moves.
@@ -385,6 +389,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
         shock.Process(tp_l, tp_r);
         float fl = tilt_l.Process(fmt_l.Process(tp_l + mon_gain * in_l, hiss));
         float fr = tilt_r.Process(fmt_r.Process(tp_r + mon_gain * in_r, hiss));
+        phaser.Process(fl, fr);  // P05: phaser on the device output (after the tape sound and tilt)
         crush.Process(fl, fr);   // P02: crush on the device output (not the dry input)
         PROF_END(kProfTape, t_tape);
         vol_s += 0.002f * (vol - vol_s);   // smoothed output volume (P01 + S35)
@@ -488,8 +493,14 @@ static void CpuTestFill() {
     player.Reset();
 }
 
-static void CpuTestRun() {
+[[maybe_unused]] static void CpuTestRun() {   // not called in the fuzz build
+#ifdef DEBUG_TRACE
+    // With the diagnostic trace: the log was started in main; a hang restarts the device (4 s:
+    // the pause between cycles is 2 s) and the report is printed at the next cycle.
+    TraceWatchdogStart(4000);
+#else
     hw.StartLog(false);
+#endif
     cpu.Init(hw.AudioSampleRate(), hw.AudioBlockSize());
     // Cycle counter for the per-part breakdown.
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -499,6 +510,9 @@ static void CpuTestRun() {
     for (int cycle = 1;; cycle++) {
         System::Delay(2000);
         hw.PrintLine("CPU test, cycle %d (16-sample blocks at 48 kHz)", cycle);
+#ifdef DEBUG_TRACE
+        TracePrint();   // the report from before the last reset, if any
+#endif
         for (const CpuScenario& s : kScenarios) {
             mode = s.mode;
             battery = s.battery;
@@ -515,6 +529,7 @@ static void CpuTestRun() {
             rep_on = s.fx;
             rep_div = 32.0f;
             glitch_amt = s.fx ? 1.0f : 0.0f;
+            phaser_p = s.fx ? 1.0f : 0.0f;
             const uint32_t t0 = System::GetNow();
             bool reset = false;
             while (System::GetNow() - t0 < 5000) {
@@ -524,12 +539,104 @@ static void CpuTestRun() {
                     reset = true;
                 }
                 if (s.moves) range_a = ((System::GetNow() / 400) % 2) ? 0.32f : 0.3f;
+#ifdef DEBUG_TRACE
+                IWDG1->KR = 0xAAAA;   // watchdog refresh
+                g_trace.main_loops = g_trace.main_loops + 1;
+#endif
                 System::Delay(5);
             }
             PrintLoad(s.name);
         }
     }
 }
+
+#ifdef FUZZ_TEST
+// Hardware fuzz test, with C_DEFS="-DCPU_TEST -DDEBUG_TRACE -DFUZZ_TEST": instead of the fixed
+// scenarios, a random change to the controls every 50-200 ms, forever (pads by the same rules as
+// the real pad handler, so only reachable states). Heartbeat + trace report every 10 s.
+static uint32_t fuzz_seed = 0x2468ACE1u;
+static float FuzzRand() {   // 0 .. 1
+    fuzz_seed ^= fuzz_seed << 13;
+    fuzz_seed ^= fuzz_seed >> 17;
+    fuzz_seed ^= fuzz_seed << 5;
+    return (float)(fuzz_seed >> 8) * (1.0f / 16777216.0f);
+}
+static float FuzzPress() { return (FuzzRand() < 0.5f) ? 0.0f : FuzzRand(); }   // released half the time
+
+static void CpuFuzzRun() {
+#ifdef DEBUG_TRACE
+    TraceWatchdogStart(4000);
+#else
+    hw.StartLog(false);
+#endif
+    cpu.Init(hw.AudioSampleRate(), hw.AudioBlockSize());
+    want_play = true;
+    uint32_t next = 0, beat = System::GetNow(), changes = 0;
+    while (1) {
+#ifdef DEBUG_TRACE
+        IWDG1->KR = 0xAAAA;   // watchdog refresh
+        g_trace.main_loops = g_trace.main_loops + 1;
+#endif
+        const uint32_t now = System::GetNow();
+        if (now >= next) {
+            next = now + 50 + (uint32_t)(FuzzRand() * 150.0f);
+            changes++;
+            const float r = FuzzRand();
+            if (r < 0.08f) {
+                mode = (int)(FuzzRand() * 2.999f);
+            } else if (r < 0.30f) {
+                range_a = FuzzRand();
+            } else if (r < 0.50f) {
+                range_b = (FuzzRand() < 0.6f) ? 0.15f * FuzzRand() : FuzzRand();   // often the shortest loops
+            } else if (r < 0.56f) {
+                battery = FuzzRand();
+            } else if (r < 0.60f) {
+                fade_ms = 10.0f + 1990.0f * FuzzRand();
+            } else if (r < 0.64f) {
+                const float type = FuzzRand();
+                SetAgingFrom(FuzzRand(), type);
+                tape_type = type;
+            } else if (r < 0.71f) {   // P11, as the pad handler
+                if (want_overdub) want_overdub = false;
+                else if (want_live) want_live = false;
+                else if (!want_record && length > 0) want_overdub = true;
+                else if (!want_record) want_live = true;
+            } else if (r < 0.73f) {   // P10, as the pad handler
+                if (want_record) want_record = false;
+                else { want_overdub = false; want_live = false; want_record = true; }
+            } else if (r < 0.76f) {   // P03
+                want_play = !want_play;
+            } else if (r < 0.80f) {
+                friction = 2.0f * FuzzPress() * FuzzPress() * FuzzPress();
+            } else if (r < 0.84f) {
+                shock_sev = FuzzPress();
+            } else if (r < 0.88f) {
+                crush_amt = FuzzPress();
+            } else if (r < 0.92f) {
+                rep_on = FuzzRand() < 0.5f;
+                rep_div = (float)(4 << (int)(FuzzRand() * 3.999f));
+            } else if (r < 0.96f) {
+                glitch_amt = FuzzPress();
+            } else {
+                phaser_p = FuzzPress();
+            }
+        }
+        if (now - beat >= 10000) {
+            beat = now;
+            const int avg = (int)(cpu.GetAvgCpuLoad() * 100.0f + 0.5f);
+            const int max = (int)(cpu.GetMaxCpuLoad() * 100.0f + 0.5f);
+            hw.PrintLine("fuzz: %lu changes, load avg %d %% peak %d %%, length %lu, mode %d, play %d od %d live %d rec %d",
+                         (unsigned long)changes, avg, max, (unsigned long)length, (int)mode,
+                         (int)want_play, (int)want_overdub, (int)want_live, (int)want_record);
+            cpu.Reset();
+#ifdef DEBUG_TRACE
+            TracePrint();
+#endif
+        }
+        System::Delay(2);
+    }
+}
+#endif
 #endif
 
 int main(void) {
@@ -575,13 +682,19 @@ int main(void) {
     touch.pads().SetMaxDelta(9, 530.0f);   // P09 (finger on the tape): measured light 5-120, medium ~410, hard 505-527
     touch.pads().SetMaxDelta(8, 540.0f);   // P08 (window shock): measured light 20-145, medium ~500, hard 530-538
     touch.pads().SetMaxDelta(2, 535.0f);   // P02 (crush): like P08/P09 (their hard press tops out at ~525-535)
+    touch.pads().SetMaxDelta(5, 535.0f);   // P05 (phaser): like P08/P09
     touch.pads().SetMaxDelta(7, 535.0f);   // P07 (beat repeat): like P08/P09
     touch.pads().SetMaxDelta(6, 535.0f);   // P06 (glitch): like P08/P09
     shock.Init(sr);
+    phaser.Init(sr);
 #ifdef CPU_TEST
     CpuTestFill();
     hw.StartAudio(AudioCallback);
+#ifdef FUZZ_TEST
+    CpuFuzzRun();   // never returns
+#else
     CpuTestRun();   // never returns
+#endif
 #endif
     hw.StartAudio(AudioCallback);
 
@@ -608,7 +721,7 @@ int main(void) {
 
     bool was_vol_mode = false, was_mixing = false;
 #ifdef DEBUG_TRACE
-    TraceWatchdogStart();
+    TraceWatchdogStart(1000);
     uint32_t trace_t = System::GetNow();
 #endif
     while (1) {
@@ -638,6 +751,7 @@ int main(void) {
         friction = 2.0f * p09 * p09 * p09;            // P09: finger on the tape (pressure 0..1, gentle start); full press: 9-11 % speed
         shock_sev = touch.pads().Pressure(8);         // P08: window shock (damaged tape), pressure = severity
         crush_amt = touch.pads().Pressure(2);         // P02: crush, pressure = amount
+        phaser_p = touch.pads().Pressure(5);          // P05: phaser, pressure = depth + speed
         // P07: beat repeat while touched; pressure picks the division (harder = shorter slice).
         rep_on = touch.pads().IsTouched(7);
         const float n07 = sqrtf(touch.pads().Pressure(7));

@@ -12,8 +12,9 @@ public:
     void SetAmount(float a)
     {
         target_ = (a < 0.0f) ? 0.0f : (a > 1.0f ? 1.0f : a);
-        rate_ = exp2f(-4.585f * amt_);           // hold rate 1 .. 2 kHz / 48 kHz
-        q_ = exp2f(15.0f - 12.0f * amt_);        // 2^15 .. 2^3 steps per unit (16 .. 4 bits)
+        const float c = kRange * amt_;           // full press = kRange of the old full range
+        rate_ = exp2f(-4.585f * c);              // hold rate 48 kHz .. ~4 kHz
+        q_ = exp2f(15.0f - 12.0f * c);           // 16 .. ~6.7 bits
         inv_q_ = 1.0f / q_;
     }
 
@@ -40,6 +41,9 @@ public:
     }
 
 private:
+    // Full press = 77.5 % of the range down to 4 bits / 2 kHz: ~6.7 bits, ~4 kHz (lower bit
+    // depths silence quiet parts).
+    static constexpr float kRange = 0.775f;
     float target_ = 0.0f, amt_ = 0.0f;
     float phase_ = 1.0f;
     float hold_l_ = 0.0f, hold_r_ = 0.0f;

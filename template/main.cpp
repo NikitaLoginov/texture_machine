@@ -10,6 +10,7 @@
 #include "tilt_eq.h"
 #include "live_grains.h"
 #include "live_wear.h"
+#include "window_shock.h"
 #include "debug_trace.h"
 #include <cmath>
 
@@ -46,6 +47,7 @@ static float DSY_SDRAM_BSS live_l[kLiveRing];
 static float DSY_SDRAM_BSS live_r[kLiveRing];
 static LiveGrains live;                             // reads the live input at the tape speed
 static LiveWear   wear;                             // S32 on the live input: noise, stutter
+static WindowShock shock;                           // P08 held: damaged tape under the head
 
 // Written by main loop, read by audio callback
 static volatile bool  want_play    = false;
@@ -54,6 +56,7 @@ static volatile bool  want_overdub = false;
 static volatile bool  want_live    = false;   // live input through the tape (P11 with nothing recorded)
 static volatile float battery = 0.5f;
 static volatile float friction = 0.0f;   // P09 pressure: finger on the tape, extra motor load 0 .. 2
+static volatile float shock_sev = 0.0f;  // P08 pressure: window shock severity 0 .. 1
 static volatile float range_a = 0.0f, range_b = 1.0f;
 static volatile int   mode = GrainPlayer::FORWARD;
 static volatile float fade_ms = 200.0f, tape_type = 0.33f;
@@ -268,11 +271,13 @@ void AudioCallback(AudioHandle::InputBuffer in,
     const float kp = keep;
     const float mixv = mix;
     const float mixmode = mix_mode ? 1.0f : 0.0f;
-    const float tape_speed = motor.Process();
+    const float tape_speed = motor.Process() * shock.SpeedFactor((int)size);   // + capstan hiccups (P08)
     const float deficit    = motor.Deficit();
     // Head output follows the tape speed below 0.2: a stopped tape is silent (a dead battery,
     // ~0.23, is above it).
     const float head_lvl = fminf(5.0f * tape_speed, 1.0f);
+    // Window shock (P08) only while the tape moves, weaker with the head output.
+    shock.SetSeverity((play || live_on) ? shock_sev * head_lvl : 0.0f);
     TRACE_SET(speed, tape_speed);
     player.SetMode((GrainPlayer::Mode)mode);
     player.SetSpeed(tape_speed);
@@ -351,8 +356,11 @@ void AudioCallback(AudioHandle::InputBuffer in,
         const float hiss = fmaxf(fmaxf(e * head_lvl, mon_gain), live_gain * head_lvl);
         TRACE_STAGE(kTrTape);
         PROF_BEGIN(t_tape);
-        const float fl = tilt_l.Process(fmt_l.Process(head_lvl * (l * e + live_gain * lv_l) + mon_gain * in_l, hiss));
-        const float fr = tilt_r.Process(fmt_r.Process(head_lvl * (r * e + live_gain * lv_r) + mon_gain * in_r, hiss));
+        // Tape signal (playback + live input), with the window shock (P08) on it.
+        float tp_l = head_lvl * (l * e + live_gain * lv_l), tp_r = head_lvl * (r * e + live_gain * lv_r);
+        shock.Process(tp_l, tp_r);
+        const float fl = tilt_l.Process(fmt_l.Process(tp_l + mon_gain * in_l, hiss));
+        const float fr = tilt_r.Process(fmt_r.Process(tp_r + mon_gain * in_r, hiss));
         PROF_END(kProfTape, t_tape);
         vol_s += 0.002f * (vol - vol_s);   // smoothed output volume (P01 + S35)
         mix_s += 0.002f * (mixv - mix_s);
@@ -394,6 +402,7 @@ struct CpuScenario {
     float battery, aging, type, fade, a, b;
     bool  play, overdub, moves;
     bool  live;   // live input through the tape (forced on; rows without it: off)
+    bool  shock;  // window shock (P08) at full severity (rows without it: off)
 };
 static constexpr int kFwd = GrainPlayer::FORWARD, kBwd = GrainPlayer::BACKWARD, kPing = GrainPlayer::PINGPONG;
 static const CpuScenario kScenarios[] = {
@@ -411,6 +420,7 @@ static const CpuScenario kScenarios[] = {
     {"  same, loop moving",           kFwd, 1.0f, 1.0f, 1.0f,  2000.0f, 0.3f, 0.0f,  true,  true,  true},
     {"  same, ping-pong, moving",     kPing, 1.0f, 1.0f, 1.0f, 2000.0f, 0.3f, 0.0f,  true,  true,  true},
     {"live input, fastest, dictaphone", kFwd, 1.0f, 1.0f, 1.0f, 2000.0f, 0.3f, 0.374f, false, false, false, true},
+    {"short p-p moving + shock",      kPing, 1.0f, 1.0f, 1.0f, 2000.0f, 0.3f, 0.0f,  true,  true,  true, false, true},
 };
 
 static void PrintLoad(const char* label) {
@@ -473,6 +483,7 @@ static void CpuTestRun() {
             want_play = s.play;
             want_overdub = s.overdub;
             want_live = s.live;
+            shock_sev = s.shock ? 1.0f : 0.0f;
             const uint32_t t0 = System::GetNow();
             bool reset = false;
             while (System::GetNow() - t0 < 5000) {
@@ -532,9 +543,12 @@ int main(void) {
     live.Init(live_l, live_r, kLiveRing, sr);
     motor.Init(hw.AudioCallbackRate());
     touch.Init(hw);
-    touch.pads().SetMaxDelta(9, 520.0f);   // P09 (finger on the tape): measured light ~120, medium ~410, hard ~520
+    touch.pads().SetMaxDelta(9, 530.0f);   // P09 (finger on the tape): measured light 5-120, medium ~410, hard 505-527
+    touch.pads().SetMaxDelta(8, 540.0f);   // P08 (window shock): measured light 20-145, medium ~500, hard 530-538
+    shock.Init(sr);
 #ifdef PAD_TEST
     touch.pads().SetMaxDelta(9, 1000.0f);   // pad test: see P09's full range (normal: 425)
+    touch.pads().SetMaxDelta(8, 1000.0f);   // pad test: P08's full range too
 #endif
 #ifdef CPU_TEST
     CpuTestFill();
@@ -594,6 +608,7 @@ int main(void) {
         battery  = c31;                               // S31: battery 0 dead, 0.5 fresh, 1 over-voltage
         const float p09 = touch.pads().Pressure(9);
         friction = 2.0f * p09 * p09 * p09;            // P09: finger on the tape (pressure 0..1, gentle start); full press: 9-11 % speed
+        shock_sev = touch.pads().Pressure(8);         // P08: window shock (damaged tape), pressure = severity
 #ifdef PAD_TEST
         // Pad test (build with C_DEFS=-DPAD_TEST): P09 while touched, every 50 ms. The pad's
         // curve is pressure = norm^2, norm = (delta - 5) / (max delta - 5): print the implied delta.
@@ -607,6 +622,16 @@ int main(void) {
             const int f_m = (int)(2.0f * p09 * p09 * p09 * 1000.0f);
             hw.PrintLine("P09 pressure %d.%03d  norm %d.%03d  delta ~%d of %d  friction %d.%03d",
                          p_m / 1000, p_m % 1000, n_m / 1000, n_m % 1000, delta, max_d, f_m / 1000, f_m % 1000);
+        }
+        static uint32_t pad8_t = 0;
+        if (touch.pads().IsTouched(8) && System::GetNow() - pad8_t >= 50) {
+            pad8_t = System::GetNow();
+            const float p08 = touch.pads().Pressure(8);
+            const float norm = sqrtf(p08);
+            const int max_d = (int)touch.pads().MaxDelta(8);
+            const int delta = (int)(5.0f + norm * (float)(max_d - 5));
+            const int p_m = (int)(p08 * 1000.0f);
+            hw.PrintLine("P08 pressure %d.%03d  delta ~%d of %d", p_m / 1000, p_m % 1000, delta, max_d);
         }
 #endif
         SetAgingFrom(c32, c34);                       // S32: overdub aging per pass, scaled by tape type (S34)

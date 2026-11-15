@@ -9,6 +9,7 @@
 #include "fast_math.h"
 #include "tilt_eq.h"
 #include "live_grains.h"
+#include "live_wear.h"
 #include "debug_trace.h"
 #include <cmath>
 
@@ -44,6 +45,7 @@ static constexpr size_t kLiveRing = 48000;          // 1 s ring: live input thro
 static float DSY_SDRAM_BSS live_l[kLiveRing];
 static float DSY_SDRAM_BSS live_r[kLiveRing];
 static LiveGrains live;                             // reads the live input at the tape speed
+static LiveWear   wear;                             // S32 on the live input: noise, stutter
 
 // Written by main loop, read by audio callback
 static volatile bool  want_play    = false;
@@ -58,6 +60,7 @@ static volatile float drive = 1.0f;    // S35: multiplier on the tape saturation
 static volatile float bump = 0.0f;     // S35 right of middle: head bump amount 0 .. 1
 static volatile float tilt = 0.0f;     // S30: tilt EQ, -1 darker .. 0 flat .. 1 brighter
 static volatile float age_coef = 1.0f, age_hiss = 0.0f, age_wob = 0.0f, age_wob_pitch = 0.0f;   // overdub aging per pass (S32)
+static volatile float age_amount = 0.0f;   // S32 as set (live input wear)
 static volatile float volume = 1.0f;   // output volume, 0 .. 2 (P01 + S35)
 // Right switch = overdub mode: up = aging + volume drop per pass, center = aging only, down = aging
 // only and P01 + S35 mixes the device output (0) with the dry input (1).
@@ -207,6 +210,7 @@ static void SetAgingFrom(float amount, float type) {
     const float f_min = 8000.0f * powf(1500.0f / 8000.0f, type);
     const float a_min = 1.0f - expf(-6.2831853f * f_min / 48000.0f);
     age_coef = 1.0f - amount * (1.0f - a_min);
+    age_amount = amount;
     age_hiss = amount * (0.0003f + 0.0012f * type);   // per-pass hiss, before the low-pass
     // Printed stutter bursts per written sample: amount x 0.15/s (reel-to-reel) .. amount x
     // 1.5/s (dictaphone); each jerk peaks at up to amount x 0.5 % .. amount x 3 % pitch.
@@ -279,7 +283,8 @@ void AudioCallback(AudioHandle::InputBuffer in,
     tilt_r.SetTilt(tl);
     // Live input through the tape: grains read the input at the tape speed (pitch follows the
     // battery, wow and flutter; tempo stays live). The ring keeps running while there is no tape.
-    live.SetRatio(tape_speed);
+    wear.SetAging(age_amount, age_coef, age_hiss, age_wob, age_wob_pitch);
+    live.SetRatio(tape_speed * wear.SpeedFactor((int)size));   // + stutter jerks (S32)
     if (live_on && !was_live) live.Reset();   // grains start at the delay behind the newest input
     was_live = live_on;
     const bool live_run = (length == 0) || live_on || live_gain > 0.0f;
@@ -335,6 +340,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
         if (live_run) {
             PROF_BEGIN(t_live);
             live.Process(in_l, in_r, lv_l, lv_r);
+            wear.Process(lv_l, lv_r);   // generation noise (S32)
             PROF_END(kProfGrains, t_live);
         }
         const float hiss = fmaxf(fmaxf(e, mon_gain), live_gain);

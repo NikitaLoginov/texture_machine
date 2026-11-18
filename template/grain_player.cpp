@@ -4,15 +4,13 @@
 
 #include <cmath>
 
-void GrainPlayer::Init(const float* buf_l, const float* buf_r, size_t capacity, float sample_rate) {
-    buf_l_ = buf_l;
-    buf_r_ = buf_r;
+void GrainPlayer::Init(const TapeFrame* tape, size_t capacity, float sample_rate) {
+    tape_ = tape;
     pre_l_ = nullptr;
     pre_r_ = nullptr;
     pre_len_ = 0;
     pre_phase_ = 0;
-    ovd_l_ = nullptr;
-    ovd_r_ = nullptr;
+    has_ovd_ = false;
     ovd_pre_l_ = nullptr;
     ovd_pre_r_ = nullptr;
     ovd_pre_len_ = 0;
@@ -102,9 +100,8 @@ void GrainPlayer::SetPreRoll(const float* l, const float* r, size_t len, size_t 
     pre_phase_ = (len > 0) ? phase % len : 0;
 }
 
-void GrainPlayer::SetOverdub(const float* l, const float* r, const float* pre_l, const float* pre_r, size_t pre_len) {
-    ovd_l_ = l;
-    ovd_r_ = r;
+void GrainPlayer::SetOverdub(const float* pre_l, const float* pre_r, size_t pre_len) {
+    has_ovd_ = true;
     ovd_pre_l_ = pre_l;
     ovd_pre_r_ = pre_r;
     ovd_pre_len_ = pre_len;
@@ -235,8 +232,8 @@ void GrainPlayer::Lead(long m, float& out_l, float& out_r) const {
     out_r = 0.0f;
     if (m >= 0) {
         if (m < (long)length_) {
-            out_l = buf_l_[m];
-            out_r = buf_r_[m];
+            out_l = tape_[m].rec_l;
+            out_r = tape_[m].rec_r;
         }
     } else if (pre_len_ > 0 && -m <= (long)pre_len_) {
         const size_t j = (size_t)((long)pre_phase_ + (long)pre_len_ + m) % pre_len_;
@@ -251,8 +248,8 @@ void GrainPlayer::OvdLead(long m, float& out_l, float& out_r) const {
     out_r = 0.0f;
     if (m >= 0) {
         if (m < (long)length_) {
-            out_l = ovd_l_[m];
-            out_r = ovd_r_[m];
+            out_l = tape_[m].ovd_l;
+            out_r = tape_[m].ovd_r;
         }
     } else if (-m <= (long)ovd_pre_len_) {
         out_l = ovd_pre_l_[(long)ovd_pre_len_ + m];
@@ -268,12 +265,13 @@ void GrainPlayer::LoopSample(long base, long n, long xf, long xo, long k, float&
     long i = base + ((k >= n) ? 0 : k);
     if (i >= (long)length_) i = (long)length_ - 1;
     if (i < 0) i = 0;
+    const TapeFrame& f = tape_[i];   // both tracks of this position: one memory access
     // Recording.
     if (k >= n && xf >= 1) {
         Lead(base, out_l, out_r);
     } else {
-        out_l = buf_l_[i];
-        out_r = buf_r_[i];
+        out_l = f.rec_l;
+        out_r = f.rec_r;
         if (xf >= 1 && k >= n - xf) {
             const float u = (float)(k - (n - xf)) / (float)xf;
             const float c = FastSinHalfPi(1.0f - u), s = FastSinHalfPi(u);
@@ -284,13 +282,13 @@ void GrainPlayer::LoopSample(long base, long n, long xf, long xo, long k, float&
         }
     }
     // Overdub track.
-    if (ovd_l_ == nullptr) return;
+    if (!has_ovd_) return;
     float ol, orr;
     if (k >= n && xo >= 1) {
         OvdLead(base, ol, orr);
     } else {
-        ol = ovd_l_[i];
-        orr = ovd_r_[i];
+        ol = f.ovd_l;
+        orr = f.ovd_r;
         if (xo >= 1 && k >= n - xo) {
             const float u = (float)(k - (n - xo)) / (float)xo;
             const float c = FastSinHalfPi(1.0f - u), s = FastSinHalfPi(u);

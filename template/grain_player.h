@@ -1,12 +1,13 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include "tape.h"
 
 class GrainPlayer {
 public:
     enum Mode { FORWARD = 0, PINGPONG = 1, BACKWARD = 2 };
 
-    void Init(const float* buf_l, const float* buf_r, size_t capacity, float sample_rate);
+    void Init(const TapeFrame* tape, size_t capacity, float sample_rate);   // tape: capacity frames
     void SetLength(size_t length);     // valid recorded samples, clamp to 0..capacity
     void SetRange(float a, float b);   // loop start a (0..1 of length), b = loop length 0..1 (exponential, 100 ms .. the rest after the start); applied live at the next grain start (see Process), or on Reset()
     void SetMode(Mode mode);
@@ -29,9 +30,9 @@ public:
     // recording) is at ring index (phase + len + j) % len.
     void SetPreRoll(const float* l, const float* r, size_t len, size_t phase);
 
-    // Overdub track: same positions as the recording, read with its own short seam at the loop
-    // end (kOvdXfade), not the S33 crossfade. Lead-in before sample 0: sample m < 0 at index len + m.
-    void SetOverdub(const float* l, const float* r, const float* pre_l, const float* pre_r, size_t pre_len);
+    // Overdub track (in the tape frames): read with its own short seam at the loop end
+    // (kOvdXfade), not the S33 crossfade. Its lead-in before sample 0: sample m < 0 at index len + m.
+    void SetOverdub(const float* pre_l, const float* pre_r, size_t pre_len);
     void Reset();                      // playhead and grains back to region start
     void Process(float& out_l, float& out_r);  // one stereo frame
 
@@ -61,14 +62,12 @@ private:
     static constexpr long kOvdXfade = 480;   // overdub track seam at the loop end, samples (10 ms)
     static constexpr double kEdgeHold = 512.0;   // frozen zone margin: the record head's 10 ms tails + its lag
 
-    const float* buf_l_;
-    const float* buf_r_;
+    const TapeFrame* tape_;   // the tape: recording + overdub track per position
     const float* pre_l_;
     const float* pre_r_;
     size_t pre_len_;     // lead-in length, samples (0 = none)
     size_t pre_phase_;   // ring index of the oldest lead-in sample
-    const float* ovd_l_;      // overdub track (nullptr = none)
-    const float* ovd_r_;
+    bool has_ovd_;            // overdub track in use (SetOverdub called)
     const float* ovd_pre_l_;  // its lead-in before sample 0
     const float* ovd_pre_r_;
     size_t ovd_pre_len_;

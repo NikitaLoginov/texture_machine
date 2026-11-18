@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include "tape.h"
 
 // Tape-style overdub record head. Follows the GrainPlayer playhead, 8 samples behind it. The tape
 // has two tracks at the same positions: the recording and the overdub track. In every buffer
@@ -9,7 +10,7 @@
 class RecordHead {
 public:
     // capacity: buffer length per channel (both tracks).
-    void Init(float* buf_l, float* buf_r, float* ovd_l, float* ovd_r, size_t capacity);
+    void Init(TapeFrame* tape, size_t capacity);   // tape: capacity frames (both tracks)
     void Start();   // overdub starts: re-sync to the playhead, write nothing yet
     // Recording lead-in ring (same as GrainPlayer::SetPreRoll): len samples, oldest at index phase.
     void SetPreRoll(float* l, float* r, size_t len, size_t phase);
@@ -40,8 +41,6 @@ private:
     // One track of the tape: its buffer, its lead-in before sample 0 (a ring, oldest sample at
     // pre_phase), and the aging low-pass states of its loop samples and of its lead samples.
     struct Track {
-        float* l = nullptr;
-        float* r = nullptr;
         float* pre_l = nullptr;
         float* pre_r = nullptr;
         size_t pre_len = 0, pre_phase = 0;
@@ -51,7 +50,10 @@ private:
     };
     void Write(long k, bool bounce, size_t region_start, long region_len, long xf, long xo, long lead,
                float x_l, float x_r, float gain, float keep);
-    bool Slot(Track& t, long m, float*& pl, float*& pr);   // sample m of a track (its lead-in when m < 0)
+    bool Slot(Track& t, long m, float*& pl, float*& pr);   // lead-in ring sample m < 0 of a track
+    bool LeadGet(int n, long m, float& l, float& r);       // sample m of track n: tape (m >= 0) or lead-in
+    void LeadSet(int n, long m, float l, float r);
+    TapeFrame* tape_ = nullptr;                            // the tape: both tracks per position
     // Buffer samples passed by a head moving from `from` by s (sample k is passed when the head
     // crosses k + 0.5): first, how many, and the direction (+1 / -1).
     static void Crossings(double from, float s, long& first, long& count, long& dir);

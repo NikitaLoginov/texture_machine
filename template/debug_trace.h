@@ -39,6 +39,9 @@ struct DebugTrace {
 };
 
 extern volatile DebugTrace g_trace;
+void TraceBoot();                      // after hw.Init: keep a report from before a reset, re-arm, catchers
+void TraceWatchdogStart(uint32_t ms);  // reset if not refreshed for ms milliseconds (max ~4 s)
+void TracePrint();                     // the report (or "running") over USB serial
 #define TRACE_STAGE(s) (g_trace.stage = (s))
 #define TRACE_SET(field, v) (g_trace.field = (v))
 #else

@@ -38,6 +38,14 @@ public:
     {
         bool idle = !active_ && g_ == 0.0f;
         if (hold_ && idle) {
+            // The big ring only runs from the press on: the lead before the slice start (kXf
+            // samples) comes from the small lead ring, which always runs.
+            for (int32_t k = 1; k <= kXf; k++) {
+                const size_t j = (wi_ >= (size_t)k) ? wi_ - (size_t)k : wi_ + size_ - (size_t)k;
+                const int32_t m = (lead_i_ - k) & (kLead - 1);
+                ring_l_[j] = lead_l_[m];
+                ring_r_[j] = lead_r_[m];
+            }
             // The first pass is the live signal itself: switch at once (an equal-power fade of
             // two identical signals would bump the level).
             active_ = true;
@@ -49,12 +57,16 @@ public:
             rec_ = 0;
             idle = false;
         }
-        // Record while idle; after a press only until the ring is full.
-        if (idle || rec_ < (int32_t)size_ - kXf - 16) {
+        // The lead ring always records; the big ring from the press on, only until it is full (and
+        // through the release fade).
+        lead_l_[lead_i_] = l;
+        lead_r_[lead_i_] = r;
+        lead_i_ = (lead_i_ + 1) & (kLead - 1);
+        if (!idle && rec_ < (int32_t)size_ - kXf - 16) {
             ring_l_[wi_] = l;
             ring_r_[wi_] = r;
             if (++wi_ >= size_) wi_ = 0;
-            if (!idle) rec_++;
+            rec_++;
         }
         if (!hold_) {
             if (active_ && first_) g_ = 0.0f;   // released during the first pass: back at once
@@ -87,6 +99,7 @@ public:
 
 private:
     static constexpr int32_t kXf = 288;           // slice wrap crossfade, 6 ms
+    static constexpr int32_t kLead = 512;         // lead ring length (power of 2, > kXf)
     static constexpr float kRel = 1.0f / 480.0f;  // release crossfade step, 10 ms
 
     float* ring_l_ = nullptr;
@@ -100,5 +113,7 @@ private:
     int32_t max_len_ = 0;
     int32_t rec_ = 0;        // samples recorded since the press
     bool hold_ = false, active_ = false, first_ = false;
+    float lead_l_[kLead] = {}, lead_r_[kLead] = {};   // the last kLead samples, always (internal RAM)
+    int32_t lead_i_ = 0;                              // its next write index
     float g_ = 0.0f;         // repeat share, 0 = live tape .. 1 = repeat
 };

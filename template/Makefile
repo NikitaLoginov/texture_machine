@@ -9,6 +9,10 @@ CPP_SOURCES = \
     motor.cpp \
     tape_format.cpp \
     record_head.cpp \
+    diag.cpp \
+    cpu_test.cpp \
+    controls.cpp \
+    itcm.cpp \
     ../touch/knobs.cpp \
     ../touch/pads.cpp \
     ../touch/switches.cpp
@@ -28,6 +32,8 @@ ifdef PAD_TEST
 C_DEFS += -DPAD_TEST
 endif
 
+# Hot audio code in ITCM: libDaisy's flash linker script + the .itcm_text section.
+LDSCRIPT = texture_machine_flash.lds
 include $(SYSTEM_FILES_DIR)/Makefile
 
 libs:

@@ -21,12 +21,9 @@ static float Dub(float old, float aged, float x, float gain, float keep)
     return old + gain * (Sat(keep * aged + x) - old);
 }
 
-void RecordHead::Init(float* buf_l, float* buf_r, float* ovd_l, float* ovd_r, size_t capacity)
+void RecordHead::Init(TapeFrame* tape, size_t capacity)
 {
-    trk_[0].l = buf_l;
-    trk_[0].r = buf_r;
-    trk_[1].l = ovd_l;
-    trk_[1].r = ovd_r;
+    tape_ = tape;
     cap_ = capacity;
     for (long j = 0; j < kTail; j++) {
         const float c = cosf(1.5707963f * (float)j / (float)kTail);
@@ -77,20 +74,48 @@ float RecordHead::Noise()
     return (float)(int32_t)seed_ * (1.0f / 2147483648.0f);
 }
 
-// Pointers to sample m of a track: its buffer for m >= 0, its lead-in ring before sample 0.
+// Pointers to sample m < 0 of a track: its lead-in ring before sample 0.
 bool RecordHead::Slot(Track& t, long m, float*& pl, float*& pr)
 {
-    if (m >= 0) {
-        if (m >= (long)cap_) return false;
-        pl = &t.l[m];
-        pr = &t.r[m];
-        return true;
-    }
+    if (m >= 0) return false;
     if (t.pre_len == 0 || -m > (long)t.pre_len) return false;
     const size_t j = (size_t)((long)t.pre_phase + (long)t.pre_len + m) % t.pre_len;
     pl = &t.pre_l[j];
     pr = &t.pre_r[j];
     return true;
+}
+
+// Sample m of track n (0 recording, 1 overdub track): the tape for m >= 0, its lead-in ring before
+// sample 0. False when out of range.
+bool RecordHead::LeadGet(int n, long m, float& l, float& r)
+{
+    if (m >= 0) {
+        if (m >= (long)cap_) return false;
+        l = TapeValue(tape_[m], n, 0);
+        r = TapeValue(tape_[m], n, 1);
+        return true;
+    }
+    float* pl;
+    float* pr;
+    if (!Slot(trk_[n], m, pl, pr)) return false;
+    l = *pl;
+    r = *pr;
+    return true;
+}
+
+void RecordHead::LeadSet(int n, long m, float l, float r)
+{
+    if (m >= 0) {
+        if (m >= (long)cap_) return;
+        TapeValue(tape_[m], n, 0) = l;
+        TapeValue(tape_[m], n, 1) = r;
+        return;
+    }
+    float* pl;
+    float* pr;
+    if (!Slot(trk_[n], m, pl, pr)) return;
+    *pl = l;
+    *pr = r;
 }
 
 // Printed tape stutter on the old layers: steady tape, then at random (wob_rate_ chance per
@@ -228,12 +253,11 @@ void RecordHead::Process(double pos, float step, bool bounce, size_t region_star
             if (k < 0 || k >= (long)cap_) continue;
             const float t = (float)(((double)k + 0.5 - ghost_from_) / (double)s);
             const float w = g * tail_w_[kTail - ghost_left_];
-            Track& b = trk_[0];
-            Track& o = trk_[1];
-            b.l[k] = Dub(b.l[k], b.l[k], 0.0f, w, keep);
-            b.r[k] = Dub(b.r[k], b.r[k], 0.0f, w, keep);
-            o.l[k] = Dub(o.l[k], o.l[k], prev_l_ + t * (x_now_l - prev_l_), w, keep);
-            o.r[k] = Dub(o.r[k], o.r[k], prev_r_ + t * (x_now_r - prev_r_), w, keep);
+            TapeFrame& f = tape_[k];
+            f.rec_l = Dub(f.rec_l, f.rec_l, 0.0f, w, keep);
+            f.rec_r = Dub(f.rec_r, f.rec_r, 0.0f, w, keep);
+            f.ovd_l = Dub(f.ovd_l, f.ovd_l, prev_l_ + t * (x_now_l - prev_l_), w, keep);
+            f.ovd_r = Dub(f.ovd_r, f.ovd_r, prev_r_ + t * (x_now_r - prev_r_), w, keep);
         }
         ghost_from_ += s;
     }
@@ -320,10 +344,15 @@ void RecordHead::Write(long k, bool bounce, size_t region_start, long region_len
     const size_t j0 = region_start + (size_t)rd;
     const float fr = (float)(rd - floor(rd));
     float old_l[2], old_r[2];
+    const TapeFrame& fa = tape_[j0];
     for (int n = 0; n < 2; n++) {
-        const Track& t = trk_[n];
-        old_l[n] = (fr > 0.0f) ? t.l[j0] + fr * (t.l[j0 + 1] - t.l[j0]) : t.l[j0];
-        old_r[n] = (fr > 0.0f) ? t.r[j0] + fr * (t.r[j0 + 1] - t.r[j0]) : t.r[j0];
+        old_l[n] = TapeValue(fa, n, 0);
+        old_r[n] = TapeValue(fa, n, 1);
+        if (fr > 0.0f) {   // between two frames (the next one is only read when needed)
+            const TapeFrame& fb = tape_[j0 + 1];
+            old_l[n] += fr * (TapeValue(fb, n, 0) - old_l[n]);
+            old_r[n] += fr * (TapeValue(fb, n, 1) - old_r[n]);
+        }
     }
     // Generation noise, baked into the material: it follows the level of the old layers
     // (5 ms up, 50 ms down) over a quiet floor, and fades in over the first kGenRamp passes.
@@ -348,16 +377,20 @@ void RecordHead::Write(long k, bool bounce, size_t region_start, long region_len
         if (!t.age_init) { t.age_l = old_l[n]; t.age_r = old_r[n]; t.age_init = true; }
         t.age_l += age_coef_ * (old_l[n] + h * Noise() - t.age_l);
         t.age_r += age_coef_ * (old_r[n] + h * Noise() - t.age_r);
-        t.l[i] = Dub(t.l[i], t.age_l, xi * x_l, gain, keep);
-        t.r[i] = Dub(t.r[i], t.age_r, xi * x_r, gain, keep);
+        float& vl = TapeValue(tape_[i], n, 0);
+        float& vr = TapeValue(tape_[i], n, 1);
+        vl = Dub(vl, t.age_l, xi * x_l, gain, keep);
+        vr = Dub(vr, t.age_r, xi * x_r, gain, keep);
         // Past the loop end (not in ping-pong): the decay fades out over kTail samples, so the
         // level of the old layers has no step there if the loop later ends later.
         if (!bounce && k < kTail) {
             const long e = (long)region_start + region_len + k;
             if (e < (long)cap_) {
                 const float g = gain * tail_w_[k];
-                t.l[e] = Dub(t.l[e], t.l[e], 0.0f, g, keep);
-                t.r[e] = Dub(t.r[e], t.r[e], 0.0f, g, keep);
+                float& el = TapeValue(tape_[e], n, 0);
+                float& er = TapeValue(tape_[e], n, 1);
+                el = Dub(el, el, 0.0f, g, keep);
+                er = Dub(er, er, 0.0f, g, keep);
             }
         }
         // Lead zone before the loop start, which the player blends in at the loop end: the
@@ -373,14 +406,13 @@ void RecordHead::Write(long k, bool bounce, size_t region_start, long region_len
         } else if (n == 1) {
             xm = in_lead;
         }
-        float* pl;
-        float* pr;
+        float lead_l, lead_r;
         TRACE_STAGE(kTrLead);
-        if (!Slot(t, lead - (region_len - k), pl, pr)) continue;
-        if (!t.mage_init) { t.mage_l = *pl; t.mage_r = *pr; t.mage_init = true; }
-        t.mage_l += age_coef_ * (*pl + h * Noise() - t.mage_l);
-        t.mage_r += age_coef_ * (*pr + h * Noise() - t.mage_r);
-        *pl = Dub(*pl, t.mage_l, xm * x_l, mg, keep);
-        *pr = Dub(*pr, t.mage_r, xm * x_r, mg, keep);
+        const long m = lead - (region_len - k);
+        if (!LeadGet(n, m, lead_l, lead_r)) continue;
+        if (!t.mage_init) { t.mage_l = lead_l; t.mage_r = lead_r; t.mage_init = true; }
+        t.mage_l += age_coef_ * (lead_l + h * Noise() - t.mage_l);
+        t.mage_r += age_coef_ * (lead_r + h * Noise() - t.mage_r);
+        LeadSet(n, m, Dub(lead_l, t.mage_l, xm * x_l, mg, keep), Dub(lead_r, t.mage_r, xm * x_r, mg, keep));
     }
 }

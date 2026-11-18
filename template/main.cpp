@@ -48,7 +48,7 @@ static float DSY_SDRAM_BSS pre_r[2][kPreRoll];
 static LiveGrains live;                             // reads the live input (the input history ring) at the tape speed
 static int    live_ring = 0;     // input history ring the live grains read (kept while live mode fades out)
 static size_t live_newest = 0;   // index of its newest sample
-static constexpr size_t kRepeatRing = 48000 / 4 + 4096;   // beat repeat ring, fx box mode only: slices up to 250 ms
+static constexpr size_t kRepeatRing = 48000 * 8 + 4096;   // beat repeat ring (fx box mode, and overdub): slices up to 8 s
 static float DSY_SDRAM_BSS rep_l[kRepeatRing];
 static float DSY_SDRAM_BSS rep_r[kRepeatRing];
 static BeatRepeat repeat;                           // P07 held: beat repeat
@@ -101,6 +101,11 @@ static float   mixmode_s = 0.0f;  // 0 = normal output, 1 = mix output; 10 ms ra
 static bool    head_ran = false;  // record head ran on the previous sample
 static bool    was_live = false;
 static float   live_gain = 0.0f;  // live input through the tape 0..1, 10 ms ramp
+static float   prt_l[32] = {}, prt_r[32] = {};   // printing effects: heard minus tape, delayed to the record head
+static int     prt_i = 0;                        // next write index in that ring
+static float   print_w = 0.0f;                   // printing weight 0..1 (10 ms in, 100 ms out)
+static float   gin_w = 0.0f;                     // glitch on the overdub input 0..1 (10 ms ramp)
+static bool    was_gin = false;
 static constexpr float kRecFade = 1.0f / 480.0f;   // overdub crossfade: 10 ms at 48 kHz
 static constexpr float kOverdubKeep = 0.891f;     // overdub: old layers -1 dB per pass (switch up)
 
@@ -144,6 +149,27 @@ extern "C" __attribute__((used)) void TraceFault(uint32_t* frame) {
     NVIC_SystemReset();
 }
 
+// An interrupt without a handler (it would end in libDaisy's endless Default_Handler): save which
+// one and where the code was, then reset.
+extern "C" __attribute__((used)) void TraceUnhandled(uint32_t* frame) {
+    g_trace.lr = frame[5];
+    g_trace.pc = frame[6];
+    g_trace.psr = frame[7];
+    g_trace.ipsr = __get_IPSR();
+    g_trace.cause = 2;
+    __DSB();
+    NVIC_SystemReset();
+}
+
+extern "C" __attribute__((naked)) void TraceUnhandledEntry() {
+    __asm volatile(
+        "tst lr, #4         \n"
+        "ite eq             \n"
+        "mrseq r0, msp      \n"
+        "mrsne r0, psp      \n"
+        "b TraceUnhandled   \n");
+}
+
 extern "C" __attribute__((naked)) void TraceFaultEntry() {
     __asm volatile(
         "tst lr, #4    \n"
@@ -161,15 +187,30 @@ static void TraceBoot() {
     volatile uint32_t* src = reinterpret_cast<volatile uint32_t*>(&g_trace);
     uint32_t* dst = reinterpret_cast<uint32_t*>(&trace_report);
     const int words = sizeof(DebugTrace) / 4;
-    if (g_trace.magic == kTraceArmed && (g_trace.cause == 1 || (rsr & RCC_RSR_IWDG1RSTF))) {
+    if (g_trace.magic == kTraceArmed && (g_trace.cause == 1 || g_trace.cause == 2 || (rsr & RCC_RSR_IWDG1RSTF))) {
         for (int i = 0; i < words; i++) dst[i] = src[i];
         have_report = true;
-        report_hang = (g_trace.cause != 1);
+        report_hang = (g_trace.cause == 0);
     }
     for (int i = 0; i < words; i++) src[i] = 0;
     g_trace.magic = kTraceArmed;
     const uint32_t* v = reinterpret_cast<const uint32_t*>(SCB->VTOR);
     for (int i = 0; i < kVectors; i++) ram_vectors[i] = v[i];
+    // Interrupts without a handler all point to libDaisy's endless Default_Handler: the most
+    // common entry in the table. Route them (and NMI) to the catcher.
+    uint32_t dflt = 0;
+    int best = 0;
+    for (int i = 16; i < kVectors; i++) {
+        int n = 0;
+        for (int j = 16; j < kVectors; j++)
+            if (ram_vectors[j] == ram_vectors[i]) n++;
+        if (n > best) {
+            best = n;
+            dflt = ram_vectors[i];
+        }
+    }
+    for (int i = 2; i < kVectors; i++)
+        if (ram_vectors[i] == dflt) ram_vectors[i] = reinterpret_cast<uint32_t>(&TraceUnhandledEntry);
     for (int i = 3; i <= 6; i++)   // HardFault, MemManage, BusFault, UsageFault
         ram_vectors[i] = reinterpret_cast<uint32_t>(&TraceFaultEntry);
     SCB_CleanDCache_by_Addr(ram_vectors, sizeof(ram_vectors));
@@ -204,9 +245,12 @@ static void TracePrint() {
         return;
     }
     const DebugTrace& t = trace_report;
-    hw.PrintLine("REPORT: %s in '%s', after %lu audio blocks, %lu main loops",
-                 report_hang ? "HANG (watchdog)" : "FAULT", TraceStageName(t.stage),
-                 (unsigned long)t.blocks, (unsigned long)t.main_loops);
+    hw.PrintLine("REPORT: %s in '%s', after %lu audio blocks, %lu main loops, main loop stage %lu",
+                 report_hang ? "HANG (watchdog)" : (t.cause == 2 ? "UNHANDLED INTERRUPT" : "FAULT"),
+                 TraceStageName(t.stage), (unsigned long)t.blocks, (unsigned long)t.main_loops,
+                 (unsigned long)t.main_stage);
+    if (t.cause == 2)
+        hw.PrintLine("  interrupt: exception %lu = IRQ %ld", (unsigned long)t.ipsr, (long)t.ipsr - 16);
     if (!report_hang)
         hw.PrintLine("  pc 0x%08lx lr 0x%08lx psr 0x%08lx cfsr 0x%08lx hfsr 0x%08lx bfar 0x%08lx mmfar 0x%08lx",
                      (unsigned long)t.pc, (unsigned long)t.lr, (unsigned long)t.psr, (unsigned long)t.cfsr,
@@ -293,11 +337,23 @@ void AudioCallback(AudioHandle::InputBuffer in,
     shock.SetSeverity((play || live_on) ? shock_sev * head_lvl : 0.0f);
     crush.SetAmount(crush_amt);
     phaser.SetPressure(phaser_p, (int)size);
-    // Beat repeat (P07): in tape mode the grain player repeats a slice of the tape itself (loop /
-    // division, tape samples, so the rhythm follows the tape speed); in fx box mode the BeatRepeat
-    // ring repeats the live signal (nominal 1 s bar / division). Only while the tape moves.
-    player.SetRepeat(rep_on && play && !live_on, (double)player.RegionLen() / rep_div);
-    repeat.Set(rep_on && live_on, 48000.0f / rep_div);
+    // Printing effects (overdub): while overdubbing with a printable pad effect held (not the
+    // finger: slowing the tape doesn't change what's on it), what is heard is written back.
+    const bool print_on = od && (glitch_amt > 0.0f || rep_on || shock_sev > 0.0f || phaser_p > 0.0f || crush_amt > 0.0f);
+    player.SetPrint(print_on || print_w > 0.0f);
+    // The record head writes 8 samples behind the playhead (RecordHead's kLag), sample k at k + 0.5.
+    const float prt_d = fminf(8.0f + 0.5f / fmaxf(tape_speed, 0.1f), 30.0f);
+    const int prt_d0 = (int)prt_d;
+    const float prt_fr = prt_d - (float)prt_d0;
+    // Beat repeat (P07): in fx box mode and while overdubbing, the BeatRepeat ring repeats the
+    // signal (overdub: tape + input, so both repeat and get recorded); otherwise the grain player
+    // repeats a slice of the tape itself. Slice = loop / division (tape samples; in the ring as
+    // time at this tape speed); fx box mode a nominal 1 s bar / division. Only while it moves.
+    const bool rep_ring = live_on || od;
+    player.SetRepeat(rep_on && play && !rep_ring, (double)player.RegionLen() / rep_div);
+    const float ring_slice = live_on ? 48000.0f / rep_div
+                                     : (float)player.RegionLen() / fmaxf(tape_speed, 0.1f) / rep_div;
+    repeat.Set(rep_on && rep_ring && (play || live_on), ring_slice);
     player.SetGlitch(glitch_amt);   // P06: grains jump to random places (tape and fx box mode)
     live.SetGlitch(glitch_amt);
     TRACE_SET(speed, tape_speed);
@@ -316,7 +372,9 @@ void AudioCallback(AudioHandle::InputBuffer in,
     // Live input through the tape: grains read the input at the tape speed (pitch follows the
     // battery, wow and flutter; tempo stays live). The ring keeps running while there is no tape.
     wear.SetAging(age_amount, age_coef, age_hiss, age_wob, age_wob_pitch);
-    live.SetRatio(tape_speed * wear.SpeedFactor((int)size));   // + stutter jerks (S32)
+    // Fx box mode: tape speed + stutter jerks (S32). Glitch on the overdub input: speed 1.
+    const float wear_f = wear.SpeedFactor((int)size);
+    live.SetRatio((live_on || live_gain > 0.0f) ? tape_speed * wear_f : 1.0f);
     // The live grains read the input history ring; while live mode is on or fading out they stay
     // on their ring (a record start switches the writing to the other ring).
     if (!(live_on || live_gain > 0.0f)) live_ring = pre_live;
@@ -324,6 +382,12 @@ void AudioCallback(AudioHandle::InputBuffer in,
     if (live_on && !was_live) live.Reset();   // grains start at the delay behind the newest input
     was_live = live_on;
     const bool live_run = (length == 0) || live_on || live_gain > 0.0f;
+    // Glitch (P06) on the input while overdubbing: the live grains read the input's recent history
+    // with the glitch jumps; crossfaded in for as long as glitch is held.
+    const bool gin_on = od && glitch_amt > 0.0f;
+    if (gin_on && !was_gin && !live_run) live.Reset();
+    was_gin = gin_on;
+    const bool live_proc = live_run || gin_on || gin_w > 0.0f;
 
     for (size_t i = 0; i < size; i++) {
         float in_l = in[0][i], in_r = in[1][i];
@@ -361,9 +425,12 @@ void AudioCallback(AudioHandle::InputBuffer in,
             if (g > 0.0f || (head_ran && head.Pending())) {
                 PROF_BEGIN(t_head);
                 if (!head_ran) head.Start();   // re-sync to the playhead after a pause
+                // + the printed effects (what was heard minus the tape), delayed to this head position.
+                const float pa_l = prt_l[(prt_i - prt_d0) & 31], pb_l = prt_l[(prt_i - prt_d0 - 1) & 31];
+                const float pa_r = prt_r[(prt_i - prt_d0) & 31], pb_r = prt_r[(prt_i - prt_d0 - 1) & 31];
                 head.Process(player.Pos(), player.Step(), player.Bounces(),
                              player.RegionStart(), player.RegionLen(), player.RegionXfade(), player.RegionOvdXfade(), player.RegionLead(),
-                             in_l, in_r, g, kp);
+                             in_l + pa_l + prt_fr * (pb_l - pa_l), in_r + pa_r + prt_fr * (pb_r - pa_r), g, kp);
                 PROF_END(kProfHead, t_head);
                 head_now = true;
             }
@@ -373,24 +440,43 @@ void AudioCallback(AudioHandle::InputBuffer in,
         // sounds while the tape plays or the input goes to tape.
         live_gain = live_on ? fminf(live_gain + kRecFade, 1.0f) : fmaxf(live_gain - kRecFade, 0.0f);
         float lv_l = 0.0f, lv_r = 0.0f;
-        if (live_run) {
+        if (live_proc) {
             PROF_BEGIN(t_live);
             if (live_ring == pre_live) live_newest = (pre_pos > 0) ? pre_pos - 1 : kPreRoll - 1;
             live.Process(live_newest, lv_l, lv_r);
-            wear.Process(lv_l, lv_r);   // generation noise (S32)
+            if (live_run) wear.Process(lv_l, lv_r);   // generation noise (S32), fx box mode only
             PROF_END(kProfGrains, t_live);
         }
         const float hiss = fmaxf(fmaxf(e * head_lvl, mon_gain), live_gain * head_lvl);
         TRACE_STAGE(kTrTape);
         PROF_BEGIN(t_tape);
         // Tape signal (playback + live input), with the window shock (P08) on it.
-        float tp_l = head_lvl * (l * e + live_gain * lv_l), tp_r = head_lvl * (r * e + live_gain * lv_r);
-        if (live_run) repeat.Process(tp_l, tp_r);   // P07 in fx box mode (tape mode: in the grain player)
+        // While overdubbing the input joins the tape signal before the pad effects (beat repeat,
+        // window shock): they act on both and both get recorded. Otherwise it is added after them.
+        const float mi = od ? mon_gain : 0.0f;
+        // Glitch on the overdub input: crossfade to the live grains' (glitched) input.
+        gin_w = gin_on ? fminf(gin_w + kRecFade, 1.0f) : fmaxf(gin_w - kRecFade, 0.0f);
+        const float gi_l = in_l + gin_w * (lv_l - in_l), gi_r = in_r + gin_w * (lv_r - in_r);
+        float tp_l = head_lvl * (l * e + live_gain * lv_l) + mi * gi_l;
+        float tp_r = head_lvl * (r * e + live_gain * lv_r) + mi * gi_r;
+        if (live_run || od) repeat.Process(tp_l, tp_r);   // P07 in fx box mode and overdub (else: in the grain player)
         shock.Process(tp_l, tp_r);
-        float fl = tilt_l.Process(fmt_l.Process(tp_l + mon_gain * in_l, hiss));
-        float fr = tilt_r.Process(fmt_r.Process(tp_r + mon_gain * in_r, hiss));
+        float fl = tilt_l.Process(fmt_l.Process(tp_l + (mon_gain - mi) * in_l, hiss));
+        float fr = tilt_r.Process(fmt_r.Process(tp_r + (mon_gain - mi) * in_r, hiss));
+        const float fl0 = fl, fr0 = fr;   // before the post effects (for printing)
         phaser.Process(fl, fr);  // P05: phaser on the device output (after the tape sound and tilt)
         crush.Process(fl, fr);   // P02: crush on the device output (not the dry input)
+        // Printing: what is heard minus the plain tape under the playhead (pre-tape effects on the
+        // tape signal + post effects on the output), into the ring the record head reads.
+        print_w = print_on ? fminf(print_w + kRecFade, 1.0f) : fmaxf(print_w - 0.1f * kRecFade, 0.0f);
+        float pd_l = 0.0f, pd_r = 0.0f;
+        if (print_w > 0.0f) {
+            pd_l = print_w * ((tp_l - head_lvl * e * player.PlainL() - mi * in_l) + (fl - fl0));
+            pd_r = print_w * ((tp_r - head_lvl * e * player.PlainR() - mi * in_r) + (fr - fr0));
+        }
+        prt_l[prt_i] = pd_l;
+        prt_r[prt_i] = pd_r;
+        prt_i = (prt_i + 1) & 31;
         PROF_END(kProfTape, t_tape);
         vol_s += 0.002f * (vol - vol_s);   // smoothed output volume (P01 + S35)
         mix_s += 0.002f * (mixv - mix_s);
@@ -733,7 +819,9 @@ int main(void) {
             TracePrint();
         }
 #endif
+        TRACE_SET(main_stage, 1);
         touch.Process();
+        TRACE_SET(main_stage, 2);
         Knobs& k = touch.knobs();
         const float c31 = ctl[1].Process(k.s31());
         const float c32 = ctl[2].Process(k.s32());
@@ -792,6 +880,8 @@ int main(void) {
         else if (sw == Switch3::POS_DOWN) mode = GrainPlayer::BACKWARD;
         else                              mode = GrainPlayer::PINGPONG;
         hw.SetLed(want_record || want_overdub || want_live);   // LED: recording, overdubbing or live input
+        TRACE_SET(main_stage, 3);
         System::Delay(3);
+        TRACE_SET(main_stage, 4);
     }
 }

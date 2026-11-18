@@ -18,6 +18,11 @@ public:
     void SetGlitch(float amount) { glitch_ = (amount < 0.0f) ? 0.0f : (amount > 1.0f ? 1.0f : amount); }   // P06: share of grains that jump to random places (once per block)
     // P07 beat repeat in tape mode (once per block): held, and the slice length in tape samples.
     void SetRepeat(bool hold, double slice) { rep_hold_ = hold; rep_next_len_ = (slice < 2.0 * kRepXf) ? 2.0 * kRepXf : slice; }
+    // Printing effects (overdub): while on, Process also stores the plain tape under the playhead
+    // (both tracks, no effects), read with PlainL() / PlainR() after Process. Once per block.
+    void SetPrint(bool on) { print_ = on; }
+    float PlainL() const { return plain_l_; }
+    float PlainR() const { return plain_r_; }
 
     // Lead-in: the input just before the recording, a ring of len samples per channel whose
     // oldest sample is at index phase. Lead-in sample j (-len .. -1, -1 = just before the
@@ -108,4 +113,6 @@ private:
     double rep_start_;                     // slice start in that loop
     double rep_q_;                         // read position in the slice, tape samples
     double rep_len_, rep_next_len_;        // slice length now / from the next wrap on
+    bool print_;                           // store the plain tape under the playhead
+    float plain_l_, plain_r_;              // that sample (this Process)
 };

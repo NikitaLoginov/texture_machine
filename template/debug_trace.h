@@ -28,6 +28,8 @@ struct DebugTrace {
     uint32_t stage;       // TraceStage the audio path is in
     // Fault registers and where it happened.
     uint32_t pc, lr, psr, cfsr, hfsr, bfar, mmfar;
+    uint32_t ipsr;        // unhandled interrupt: its exception number (IRQ = ipsr - 16)
+    uint32_t main_stage;  // main loop: 1 pad + knob read, 2 after it, 3 in the 3 ms delay, 4 after it
     // Player.
     int32_t  mode, rs, rl;
     float    pos, step, speed;

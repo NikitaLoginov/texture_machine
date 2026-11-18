@@ -30,6 +30,8 @@ void GrainPlayer::Init(const float* buf_l, const float* buf_r, size_t capacity, 
     rep_dir_ = 1.0f;
     rep_base_ = rep_n_ = rep_start_ = rep_q_ = 0.0;
     rep_len_ = rep_next_len_ = 2.0 * kRepXf;
+    print_ = false;
+    plain_l_ = plain_r_ = 0.0f;
     mode_ = FORWARD;
     speed_ = 1.0f;
     ratio_ = 1.0f;
@@ -400,6 +402,18 @@ void GrainPlayer::Process(float& out_l, float& out_r) {
             const float w0 = 0.5f - 0.5f * cosf(kTwoPi * phase_);
             l = l1 + w0 * (l0 - l1);
             r = r1 + w0 * (r0 - r1);
+        }
+    }
+
+    // Printing (overdub with effects): the plain tape under the playhead. The grains' output when
+    // they sit exactly on the playhead in the current loop, else one read.
+    if (print_) {
+        const bool grains_read = !(rep_on_ && rep_g_ >= 1.0f);
+        if (grains_read && coincide && gbase_[0] == region_start_ && glen_[0] == region_len_ && fabs(rel0 - pos_) < 1e-6) {
+            plain_l_ = l;
+            plain_r_ = r;
+        } else {
+            ReadAt(pos_, (long)region_start_, (long)region_len_, plain_l_, plain_r_);
         }
     }
 
